@@ -1,0 +1,21 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local configuration and generated data
+.env
+.env.*
+!.env.example
+data/owasp/*
+!data/owasp/.gitkeep
+evaluation/results/
+qdrant_storage/
+.DS_Store
