@@ -20,9 +20,11 @@ Keep the project small, modular, maintainable, and suitable for running locally.
 | Validation | Pydantic v2 |
 | Vector database | Qdrant (Docker) |
 | Embeddings | FastEmbed — BAAI/bge-small-en-v1.5 |
+| Reranking | Sentence Transformers CrossEncoder — `cross-encoder/ms-marco-MiniLM-L6-v2` |
 | LLM | Configurable OpenAI-compatible API |
 | Chunking | LangChain text splitters |
 | Tokenizer | Embedding-model-compatible tokenizer |
+| Reranker runtime | sentence-transformers |
 | HTTP client | httpx |
 | Testing | pytest |
 | Linting | Ruff |
@@ -119,6 +121,9 @@ Do not implement fixed-size chunking as a separate strategy or add a strategy se
 | Overlap between parents or Markdown sections | 0 |
 | Child overlap within the same oversized section and parent | Up to 60 tokens |
 | Embedding model | BAAI/bge-small-en-v1.5 |
+| Cross-encoder reranker | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Reranker candidate pool | 20 child hits |
+| Final retrieved children | 3 |
 
 These are the selected MVP defaults, not universally optimal sizes. Keep short sections short rather than padding them to a target size.
 
@@ -205,6 +210,7 @@ Keep parent text in one place rather than duplicating it in every child payload.
 - [LangChain Markdown splitting](https://docs.langchain.com/oss/python/integrations/splitters/markdown_header_metadata_splitter): heading metadata, per-section recursive splitting, overlap behavior, and formatting limitations.
 - [LangChain parent-document retrieval implementation](https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/retrievers/parent_document_retriever.py): searching small children and resolving their stored parent IDs. This is a design reference, not a required dependency.
 - [BAAI model card](https://huggingface.co/BAAI/bge-small-en-v1.5): 384-dimensional embeddings and a 512-token input limit.
+- [Cross-encoder model card](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2): reference implementation and passage-ranking model details.
 
 ## 5. Qdrant Vector Storage
 
@@ -283,6 +289,8 @@ The ingestion pipeline:
 7. Persist parent records, upsert child points into Qdrant, and complete revision cleanup as specified in Section 5.
 8. Log ingestion statistics.
 
+The cross-encoder is loaded and used at retrieval time, not during ingestion.
+
 Track:
 
 - Number of documents processed
@@ -297,36 +305,40 @@ Embedding should be performed offline through the ingestion CLI, not during Fast
 
 ## 7. Semantic Retrieval
 
-Implement semantic similarity search using Qdrant.
+Implement a two-stage retrieval pipeline: dense semantic candidate retrieval using Qdrant, followed by cross-encoder reranking.
 
 Retrieval configuration:
 
-**Top-K = 3**
+**Candidate-K = 20; final-K = 3**
 
 ### Retrieval flow
 
 1. Receive user question.
 2. Generate query embedding using the same model.
 3. Search the single Qdrant collection.
-4. Retrieve the three most similar child chunks, or fewer if fewer are available.
-5. Return child IDs, parent IDs, content, scores, titles, sections, filenames, and source URLs.
+4. Retrieve up to 20 highest-scoring child candidates, or fewer when the collection contains fewer points.
+5. Score each `(question, child embedding text)` pair with the configured cross-encoder. Run inference in batches, with truncation disabled or explicitly validated against the reranker model's maximum input length.
+6. Sort by cross-encoder score descending, use the original dense score only as a deterministic tie-breaker, and retain the final three children, or fewer when fewer are available.
+7. Return child IDs, parent IDs, dense scores, reranker scores, titles, sections, filenames, and source URLs.
+
+The cross-encoder score is the final retrieval rank signal; it is not comparable to the Qdrant similarity score and must not be blended unless a later evaluated change specifies normalization and weights. A cross-encoder is query-dependent and cannot be precomputed during ingestion, so load it once per process and reuse it across requests. If reranking fails, log the failure and return the dense candidates only when the API contract explicitly marks the response as degraded; do not silently present dense scores as reranker scores.
 
 For `/ask`, resolve the returned `parent_id` values in the persistent parent store and use the parents as generation context:
 
 - Deduplicate parents while preserving the rank of their highest-scoring matching child.
 - Keep matched child IDs and scores for traceability. Scores belong to child matches, not separately scored parents.
 - Expand only to the immediate stored parent; do not recursively fetch the whole document or unrelated siblings.
-- Top-3 means three child hits, which can yield one to three distinct parents. Do not fetch extra hits merely to fill three parents.
+- Top-3 means the three reranked child hits, which can yield one to three distinct parents. Do not fetch extra hits merely to fill three parents.
 - If a parent is missing or its document/configuration revision differs from the child, log an integrity error and fall back to that child's text. Never substitute content from a different revision.
 - Enforce the generation model's context budget after reserving space for instructions, the question, formatting, and output. Prefer full parents; when a parent does not fit, use its matching children if they fit. Omit remaining units in rank order rather than silently truncating them, and report insufficient evidence when necessary.
 
-Support optional filtering by `document_id`.
+Support optional filtering by `document_id` before reranking.
 
-Do not implement hybrid search, reranking, or query rewriting in the MVP.
+Do not implement hybrid search or query rewriting in the MVP.
 
 ## 8. RAG Answer Generation
 
-Use a straightforward two-step RAG pipeline:
+Use a straightforward retrieval-and-generation RAG pipeline:
 
 ```text
 User Question
@@ -335,7 +347,9 @@ Query Embedding
     ↓
 Qdrant Similarity Search
     ↓
-Top-3 Retrieved Children
+Cross-Encoder Reranking (top 20 candidates)
+    ↓
+Top-3 Reranked Children
     ↓
 Resolve Parent IDs and Deduplicate Parents
     ↓
@@ -376,14 +390,15 @@ Input:
 }
 ```
 
-Return the Top-3 retrieved child chunks, with fewer results when fewer are available. `/search` returns the matching child text; `/ask` performs parent expansion internally.
+Return the Top-3 reranked child chunks, with fewer results when fewer are available. `/search` returns the matching child text; `/ask` performs parent expansion internally.
 
 Each result includes:
 
 - Child ID (`id`)
 - Parent ID (`parent_id`)
 - Text
-- Similarity score
+- Dense similarity score
+- Cross-encoder reranker score
 - Document ID
 - Title
 - File name
@@ -443,12 +458,12 @@ Do not implement chunking-size, overlap, or Top-K comparison experiments.
 
 We have selected one configuration:
 
-- Markdown-aware parent–child chunking
+- Markdown-aware parent–child chunking with cross-encoder reranking
 - 1,200-token maximum for parent text including headings
 - 450-token maximum for complete child embedding inputs
 - Up to 60-token child overlap within the same oversized section and parent
 - No overlap between sections or parents
-- Top-3 child retrieval followed by parent expansion for answers
+- Retrieve 20 dense child candidates, rerank with the cross-encoder, keep the top 3 children, then expand to parents for answers
 
 Focus evaluation on the quality of this configuration.
 
@@ -468,10 +483,11 @@ For every question, identify expected relevant documents and sections. Distingui
 
 Measure:
 
-- Recall@3 and MRR@3 over child hits, using the expected document/section relevance labels
+- Dense-candidate Recall@20
+- Reranked Recall@3 and MRR@3 over final child hits, using expected document/section relevance labels
 - Relevant-section coverage in the final expanded context after budgeting, reported separately from child retrieval metrics
 - Number of distinct parents included and generation-context token count
-- Retrieval latency
+- Dense retrieval latency, reranking latency, and end-to-end retrieval latency
 - Embedding duration
 - Indexing duration
 
@@ -508,6 +524,7 @@ ai-security-rag/
 │       │   └── qdrant_store.py
 │       ├── rag/
 │       │   ├── retriever.py
+│       │   ├── reranker.py
 │       │   ├── generator.py
 │       │   └── service.py
 │       ├── evaluation/
@@ -574,13 +591,14 @@ Avoid unnecessary layers, patterns, and abstractions.
 ### Phase 4 — Search API
 
 - Implement semantic retrieval.
+- Retrieve a 20-child dense candidate pool and rerank it with the cross-encoder in batches.
 - Implement `/search`.
-- Use Top-3 retrieval.
+- Return the top three reranked children with both dense and reranker scores.
 - Add optional document filtering.
 - Return child IDs, parent IDs, source metadata, and child similarity scores.
 - Add retrieval tests.
 
-**Acceptance:** Representative questions retrieve relevant OWASP content.
+**Acceptance:** Representative questions retrieve relevant OWASP content, and reranking is observable through scores and improves or preserves the labeled top-3 retrieval results.
 
 ### Phase 5 — Answer generation
 
@@ -619,6 +637,7 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Test chunking-configuration changes, interrupted parent/child writes, retries, and obsolete-parent cleanup.
 - Test Qdrant retrieval using an isolated test collection.
 - Test Top-3 child semantics, parent deduplication, missing-parent fallback, context budgeting, and citation provenance.
+- Test candidate-pool limits, reranker ordering and tie-breaking, reranker input limits, model-load reuse, and explicit degraded behavior when reranking fails.
 - Add structured logs for ingestion and retrieval operations.
 - Never commit API keys or other secrets.
 
@@ -634,7 +653,6 @@ Do not implement:
 - LangGraph
 - AI agents
 - Hybrid search
-- Reranking
 - Frontend
 - Conversation memory
 - Authentication
@@ -653,7 +671,7 @@ The project is complete when:
 5. One Qdrant collection stores all child vectors; the local parent store survives restarts.
 6. Every child point contains a valid parent ID, document ID, title, filename, source metadata, and hashes.
 7. Ingestion is idempotent.
-8. `/search` returns relevant Top-3 child chunks with parent IDs.
+8. `/search` retrieves up to 20 dense candidates, reranks them with the cross-encoder, and returns the relevant Top-3 child chunks with both scores and parent IDs.
 9. `/ask` resolves and deduplicates parents and generates grounded answers with traceable citations within the generation model's context budget.
 10. Retrieval evaluation and tests run successfully.
 11. The README contains installation, usage, architecture, and evaluation instructions.
