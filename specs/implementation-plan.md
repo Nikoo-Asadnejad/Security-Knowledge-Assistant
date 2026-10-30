@@ -6,7 +6,7 @@ Build a RAG-powered AI Security Knowledge Assistant using the official OWASP Top
 
 The application answers questions about LLM vulnerabilities, security risks, attack scenarios, and mitigations using retrieved OWASP documentation.
 
-**Primary goal:** Learn RAG engineering through practical implementation of document ingestion, Markdown-aware chunking, embeddings, Qdrant, semantic retrieval, grounded generation, and evaluation.
+**Primary goal:** Learn RAG engineering through practical implementation of document ingestion, Markdown-aware parent–child chunking, embeddings, Qdrant, semantic retrieval, grounded generation, and evaluation.
 
 Keep the project small, modular, maintainable, and suitable for running locally.
 
@@ -103,59 +103,64 @@ Preserve OWASP attribution and follow the source's CC BY-SA 4.0 license requirem
 
 ## 4. Chunking Strategy
 
-Implement **only Markdown-aware hierarchical chunking**.
+Implement **Markdown-aware splitting combined with parent–child chunking** as one pipeline. Markdown headings define semantic boundaries; parent–child relationships connect small searchable chunks to larger context units.
 
-Do not implement fixed-size chunking as a separate strategy.
+Every searchable child chunk must contain a non-null `parent_id` that resolves to a stored parent. A heading path alone does not provide this relationship.
+
+Do not implement fixed-size chunking as a separate strategy or add a strategy selector.
 
 ### Configuration
 
 | Parameter | Value |
 |---|---|
-| Strategy | Markdown-aware |
-| Chunk size | 450 tokens |
-| Overlap between sections | 0 |
-| Overlap within oversized sections | 60 tokens |
+| Strategy | Markdown-aware parent–child |
+| Parent maximum | 1,200 tokens, including headings |
+| Child maximum | 450 tokens for the complete embedding input |
+| Overlap between parents or Markdown sections | 0 |
+| Child overlap within the same oversized section and parent | Up to 60 tokens |
 | Embedding model | BAAI/bge-small-en-v1.5 |
+
+These are the selected MVP defaults, not universally optimal sizes. Keep short sections short rather than padding them to a target size.
 
 ### Chunking algorithm
 
-**Step 1 — Parse Markdown**
+**Step 1 — Parse Markdown structure**
 
-Identify document headings and their hierarchy:
+Identify ATX headings (`#` through `######`) and preserve their hierarchy, document title, source positions, and Markdown blocks.
 
-- `#` — Document title
-- `##` — Section
-- `###` — Subsection
-- `####` — Nested subsection
+- Determine section levels relative to the document-title heading. The supplied OWASP files use `##` for the title, `###` for sections, and `####` for subsections; do not assume that every title uses `#`.
+- Ignore heading-like text inside fenced code blocks.
+- Preserve introductory text directly beneath the title, even when it has no section heading.
+- Distinguish repeated heading names by their occurrence/source position, not just their text.
+- Retain source slices for stored text; do not rely on a splitter that normalizes whitespace to reproduce the original Markdown.
 
-Preserve the document title, heading path, section metadata, and original Markdown structure.
+**Step 2 — Build bounded parents**
 
-**Step 2 — Split by sections**
+Start with each section immediately beneath the document title, including its introductory text and nested subsections, as a candidate parent. Treat any document introduction as a separate candidate with the document title as its heading path.
 
-Split content using Markdown heading boundaries.
+- Keep a candidate of at most 1,200 tokens as one parent.
+- Partition an oversized candidate in source order, preferring subsection boundaries, then paragraph, list-item, table-row, code-line, and sentence boundaries as needed.
+- Never combine unrelated top-level sections or overlap parents. Preserve all nonempty source content.
+- Keep a fitting Markdown block intact. For an oversized block, split at its natural internal boundaries and retain its table-header or code-language context in metadata. Stored `text` remains an original source slice; any table headers or fence markers restored when rendering embedding/generation input count toward the relevant token limit.
+- Retain the original heading path and source range on each resulting parent, even when one section produces multiple parents.
+- Do not create empty or heading-only parents. A short section may legitimately produce one parent and one child.
 
-Each section becomes an independent logical unit.
+Each stored parent has an `id`, `document_id`, `section`, `heading_path`, `text`, `parent_index`, `source_start`, `source_end`, `document_hash`, `parent_hash`, and `chunking_config_hash`, plus the document's title, filename, version, and source metadata. Source ranges are zero-based, half-open character offsets into the decoded original document; `parent_hash` hashes the stored parent text. Parents are context records and are not embedded.
 
-Do not overlap content between unrelated sections.
+**Step 3 — Split each parent into searchable children**
 
-**Step 3 — Handle chunk sizes**
+Within each parent, first split at nested Markdown heading boundaries so a child belongs to one heading path. Keep section introductory text as its own logical unit.
 
-For each section:
+- Keep a logical unit as one child when its complete embedding input fits within 450 tokens.
+- Otherwise split recursively, preferring paragraph, list-item, table-row, code-line, and sentence boundaries. Use token-level fallback only when no natural boundary fits.
+- Apply up to 60 tokens of overlap only between children split from the same oversized logical unit within the same parent. Reduce overlap when necessary to respect the token limit or ensure forward progress.
+- Never overlap across headings or parent boundaries, even if two parents originate from the same large section.
+- Preserve lists, code fences, and tables where possible, with the same oversized-block fallback as for parents.
+- Avoid empty or heading-only children. Every child belongs to exactly one parent and retains its own full heading path and original source range.
 
-- If the section fits within 450 tokens, keep it as one chunk.
-- If the section exceeds 450 tokens, split it recursively.
-- Use a 60-token overlap only between chunks originating from the same oversized section.
-- Prefer paragraph and sentence boundaries.
-- Preserve Markdown lists and code fences where possible.
-- Avoid empty chunks and heading-only chunks.
+**Step 4 — Add semantic context and validate token budgets**
 
-Use the embedding model's tokenizer to validate chunk lengths.
-
-The embedding model supports up to 512 input tokens. Account for special tokens and any title or heading information added to the embedded text so input is not silently truncated.
-
-**Step 4 — Add semantic context**
-
-Include the document title and heading path in the text submitted for embedding.
+Include the document title and the child's heading path in the text submitted for embedding, without repeating the title in both fields.
 
 For example:
 
@@ -166,14 +171,40 @@ Section: Prevention and Mitigation Strategies
 [Actual section content...]
 ```
 
-Keep the original chunk content separately in the payload.
+Keep the original child content separately in the payload. Store `parent_id` as metadata; do not insert IDs or the full parent text into the embedding input.
 
-**Step 5 — Hash chunks**
+Use the embedding model's tokenizer with truncation disabled. The 450-token child limit includes the contextual prefix, child text, any embedding wrapper, and special tokens. Compute the available body budget after accounting for that overhead and validate the exact input before embedding. The model's hard limit is 512 tokens; never rely on silent truncation. Reject a configuration or heading prefix that leaves no usable body budget.
 
-Calculate:
+Use the same tokenizer without truncation to enforce the 1,200-token parent limit, including heading context and any restored Markdown syntax. Parents do not have the embedding model's 512-token restriction because they are not embedded. Answer-context budgeting uses the configured generation model's tokenizer.
 
-- `document_hash`: SHA-256 of the complete source file.
-- `chunk_hash`: SHA-256 of the final chunk text.
+Use `MarkdownHeaderTextSplitter` for heading metadata where appropriate and a token-aware `RecursiveCharacterTextSplitter` for oversized units. Preserve metadata with `split_documents`; the default character-count length function is insufficient. Keep parent creation, deterministic IDs, and source-text preservation explicit in the ingestion code. Do not add the full LangChain retriever framework solely for this feature.
+
+**Step 5 — Assign identifiers and hashes**
+
+- `document_hash`: SHA-256 of the complete original source file bytes.
+- `parent_hash`: SHA-256 of the UTF-8 stored parent text.
+- `chunk_hash`: SHA-256 of the UTF-8 stored child text, excluding the contextual embedding prefix.
+- `chunking_config_hash`: SHA-256 of canonical configuration including algorithm version, heading rules, parent/child limits, overlap, embedding model/tokenizer identity, and embedding-prefix format.
+
+Generate deterministic UUIDs with a fixed UUIDv5 namespace:
+
+- Parent `id`: document ID, document hash, configuration hash, section occurrence, and parent position within that section.
+- Child `id` / Qdrant point ID: parent ID, child position within the parent, and chunk hash.
+- Child `parent_id`: exactly the corresponding parent record's `id`, including for a parent with only one child.
+
+Document revisions intentionally create new IDs. Identical content and configuration must reproduce the same IDs; duplicate headings or repeated text at different positions must not collide.
+
+### Parent storage
+
+Persist parents separately from child vectors. For this ten-document local MVP, use a configurable `data/parents/` directory with one JSON file per document revision/configuration, containing parent records keyed by `id`. Use atomic file replacement. The API must load these records after restart; an ingestion-only in-memory map is insufficient.
+
+Keep parent text in one place rather than duplicating it in every child payload. No additional database service or Qdrant collection is required. See Section 5 for coordinated ingestion and cleanup.
+
+### Design references
+
+- [LangChain Markdown splitting](https://docs.langchain.com/oss/python/integrations/splitters/markdown_header_metadata_splitter): heading metadata, per-section recursive splitting, overlap behavior, and formatting limitations.
+- [LangChain parent-document retrieval implementation](https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/retrievers/parent_document_retriever.py): searching small children and resolving their stored parent IDs. This is a design reference, not a required dependency.
+- [BAAI model card](https://huggingface.co/BAAI/bge-small-en-v1.5): 384-dimensional embeddings and a 512-token input limit.
 
 ## 5. Qdrant Vector Storage
 
@@ -187,10 +218,14 @@ Embedding model:
 
 Vector dimensions: 384.
 
-### Qdrant point payload
+Store only searchable children as vector points. Parent records live in the local parent store described in Section 4.
+
+### Qdrant child point payload
 
 ```json
 {
+  "id": "<deterministic-child-uuid>",
+  "parent_id": "<deterministic-parent-uuid>",
   "document_id": "owasp-llm-2026-llm01-prompt-injection",
   "document_code": "LLM01",
   "title": "Prompt Injection",
@@ -202,33 +237,34 @@ Vector dimensions: 384.
   ],
   "text": "Actual chunk content...",
   "chunk_index": 0,
+  "child_index": 0,
+  "source_start": 100,
+  "source_end": 500,
   "source_path": "data/owasp/LLM01_PromptInjection.md",
   "source_url": "https://github.com/GenAI-Security-Project/GenAI-LLM-Top10/blob/main/2026/final/LLM01_PromptInjection.md",
   "document_hash": "<sha256>",
   "chunk_hash": "<sha256>",
+  "chunking_config_hash": "<sha256>",
   "version": "2026"
 }
 ```
 
 ### Point identification
 
-Generate deterministic UUIDs using:
-
-- Document ID
-- Chunk position
-- Chunking configuration
-
-Do not use random IDs for repeated ingestion.
+Use the deterministic parent and child UUID rules from Section 4. The Qdrant point ID must equal the payload's child `id`. `chunk_index` is document-wide; `child_index` is relative to the parent. Do not use random IDs for repeated ingestion.
 
 ### Idempotent ingestion
 
 - Detect whether the document has already been indexed.
-- Compare stored `document_hash` with the current file hash.
-- Skip unchanged documents.
-- Reprocess changed documents.
-- Remove obsolete points when documents are updated.
+- Compare both `document_hash` and `chunking_config_hash` with the completed ingestion state, and verify that the parent store is available.
+- Skip documents only when source, configuration, and stored parent/child records are complete and unchanged.
+- Reprocess changed documents or chunking configurations, including migration from chunks without `parent_id`.
+- Validate parent references and persist the new revision's parent file before upserting its child points. Retain previous parent files while their children still exist.
+- After all new child upserts succeed, remove obsolete child points, then delete unreferenced parent revisions, and only then mark ingestion complete.
 - Avoid duplicate vectors and stale chunks.
-- Handle indexing failures without incorrectly marking a document as successfully indexed.
+- Handle failures without incorrectly marking a document as successfully indexed; retries must converge using deterministic IDs. Never delete parents still referenced by stored children.
+
+For the local MVP, run ingestion while the API is stopped. Atomic visibility across the filesystem and Qdrant during concurrent reindexing is out of scope.
 
 Keep the Qdrant collection name configurable, but use only one collection for this project.
 
@@ -240,17 +276,18 @@ The ingestion pipeline:
 
 1. Read locally downloaded Markdown files.
 2. Parse Markdown headings.
-3. Generate chunks.
-4. Calculate hashes and metadata.
-5. Prepare embedding text with contextual headings.
-6. Generate embeddings in batches.
-7. Upsert points into Qdrant.
+3. Generate bounded Markdown parents and their searchable children.
+4. Calculate hashes, deterministic IDs, parent links, and source metadata.
+5. Prepare and validate child embedding inputs with contextual headings.
+6. Generate child embeddings in batches; do not embed parents.
+7. Persist parent records, upsert child points into Qdrant, and complete revision cleanup as specified in Section 5.
 8. Log ingestion statistics.
 
 Track:
 
 - Number of documents processed
-- Number of chunks created
+- Number of parents and children created
+- Child token lengths and invalid parent-reference failures
 - Embedding duration
 - Indexing duration
 - Documents skipped as unchanged
@@ -271,8 +308,17 @@ Retrieval configuration:
 1. Receive user question.
 2. Generate query embedding using the same model.
 3. Search the single Qdrant collection.
-4. Retrieve the three most similar chunks.
-5. Return content, scores, titles, sections, filenames, and source URLs.
+4. Retrieve the three most similar child chunks, or fewer if fewer are available.
+5. Return child IDs, parent IDs, content, scores, titles, sections, filenames, and source URLs.
+
+For `/ask`, resolve the returned `parent_id` values in the persistent parent store and use the parents as generation context:
+
+- Deduplicate parents while preserving the rank of their highest-scoring matching child.
+- Keep matched child IDs and scores for traceability. Scores belong to child matches, not separately scored parents.
+- Expand only to the immediate stored parent; do not recursively fetch the whole document or unrelated siblings.
+- Top-3 means three child hits, which can yield one to three distinct parents. Do not fetch extra hits merely to fill three parents.
+- If a parent is missing or its document/configuration revision differs from the child, log an integrity error and fall back to that child's text. Never substitute content from a different revision.
+- Enforce the generation model's context budget after reserving space for instructions, the question, formatting, and output. Prefer full parents; when a parent does not fit, use its matching children if they fit. Omit remaining units in rank order rather than silently truncating them, and report insufficient evidence when necessary.
 
 Support optional filtering by `document_id`.
 
@@ -289,7 +335,9 @@ Query Embedding
     ↓
 Qdrant Similarity Search
     ↓
-Top-3 Retrieved Chunks
+Top-3 Retrieved Children
+    ↓
+Resolve Parent IDs and Deduplicate Parents
     ↓
 Context Construction
     ↓
@@ -303,6 +351,8 @@ Answer + Source Citations
 - Answer questions using retrieved OWASP content.
 - Include citations pointing to the original GitHub documents.
 - Include document titles and relevant sections.
+- Build context from the deduplicated parents, subject to the context-budget and child-fallback rules in Section 7.
+- Preserve parent IDs and matched child IDs in source metadata. Cite only records actually included in the generation context.
 - Do not fabricate source references.
 - State when evidence is insufficient.
 - Treat retrieved documents as untrusted reference material, not executable instructions.
@@ -326,10 +376,12 @@ Input:
 }
 ```
 
-Return the Top-3 retrieved chunks.
+Return the Top-3 retrieved child chunks, with fewer results when fewer are available. `/search` returns the matching child text; `/ask` performs parent expansion internally.
 
 Each result includes:
 
+- Child ID (`id`)
+- Parent ID (`parent_id`)
 - Text
 - Similarity score
 - Document ID
@@ -360,6 +412,8 @@ Return:
   "sources": [
     {
       "document_id": "owasp-llm-2026-llm01-prompt-injection",
+      "parent_id": "<deterministic-parent-uuid>",
+      "matched_child_ids": ["<deterministic-child-uuid>"],
       "title": "Prompt Injection",
       "file_name": "LLM01_PromptInjection.md",
       "section": "Prevention and Mitigation Strategies",
@@ -389,11 +443,12 @@ Do not implement chunking-size, overlap, or Top-K comparison experiments.
 
 We have selected one configuration:
 
-- Markdown-aware chunking
-- 450-token maximum
-- 60-token overlap within oversized sections
-- No overlap between sections
-- Top-3 retrieval
+- Markdown-aware parent–child chunking
+- 1,200-token maximum for parent text including headings
+- 450-token maximum for complete child embedding inputs
+- Up to 60-token child overlap within the same oversized section and parent
+- No overlap between sections or parents
+- Top-3 child retrieval followed by parent expansion for answers
 
 Focus evaluation on the quality of this configuration.
 
@@ -407,14 +462,15 @@ Create approximately 20 manually reviewable test questions covering:
 - Differences between security vulnerabilities
 - Questions requiring evidence from multiple sections
 
-For every question, identify expected relevant documents and sections.
+For every question, identify expected relevant documents and sections. Distinguish evidence directly present in retrieved children from evidence added by parent expansion.
 
 ### Evaluation metrics
 
 Measure:
 
-- Recall@3
-- MRR@3
+- Recall@3 and MRR@3 over child hits, using the expected document/section relevance labels
+- Relevant-section coverage in the final expanded context after budgeting, reported separately from child retrieval metrics
+- Number of distinct parents included and generation-context token count
 - Retrieval latency
 - Embedding duration
 - Indexing duration
@@ -444,6 +500,7 @@ ai-security-rag/
 │       │   ├── downloader.py
 │       │   ├── loader.py
 │       │   ├── chunker.py
+│       │   ├── parent_store.py
 │       │   └── pipeline.py
 │       ├── embeddings/
 │       │   └── embedder.py
@@ -459,7 +516,8 @@ ai-security-rag/
 │       ├── config.py
 │       └── cli.py
 ├── data/
-│   └── owasp/
+│   ├── owasp/
+│   └── parents/
 ├── evaluation/
 │   └── questions.json
 ├── tests/
@@ -486,29 +544,32 @@ Avoid unnecessary layers, patterns, and abstractions.
 
 **Acceptance:** All ten files are locally available with valid metadata and hashes, without cloning the repository.
 
-### Phase 2 — Markdown chunking
+### Phase 2 — Markdown-aware parent–child chunking
 
 - Implement heading-aware parsing.
-- Configure 450-token chunks.
-- Implement conditional 60-token overlap for oversized sections.
+- Build bounded parents up to 1,200 tokens and children with non-null `parent_id` references.
+- Configure a 450-token maximum for complete child embedding inputs.
+- Implement conditional overlap of up to 60 tokens within an oversized section and parent.
 - Add document title and heading context to embedding text.
-- Implement chunk hashing.
+- Implement parent/child hashing, configuration hashing, and deterministic parent/child IDs.
+- Implement persistent parent storage with atomic file replacement and loading after restart.
 - Validate chunk sizes using the embedding tokenizer.
-- Test section boundaries, short sections, long sections, lists, and code fences.
+- Test relative heading levels, repeated headings, introductory text, short/long sections, oversized parents, lists, tables, and code fences.
+- Test that every child resolves to the correct parent and that overlap never crosses parent or heading boundaries.
 
-**Acceptance:** Every chunk preserves useful semantic context, respects the token budget, and has valid metadata.
+**Acceptance:** Every child preserves useful semantic context, respects the complete-input token budget, and resolves to one persisted parent from the same document/configuration revision. Parents preserve source content within the parent token limit.
 
 ### Phase 3 — Embeddings and Qdrant
 
 - Initialize FastEmbed.
-- Generate embeddings locally.
+- Generate child embeddings locally.
 - Create the Qdrant collection.
 - Store points and metadata.
 - Implement deterministic point IDs.
-- Implement incremental, idempotent ingestion.
+- Implement incremental, idempotent ingestion with coordinated parent/child updates and obsolete-revision cleanup.
 - Verify stored payloads.
 
-**Acceptance:** All ten OWASP documents are indexed without duplicates, and stored points contain titles, filenames, hashes, and source links.
+**Acceptance:** All ten OWASP documents are indexed without duplicates or dangling parent references; stored child points contain parent IDs, titles, filenames, hashes, and source links, and unchanged complete revisions can be skipped safely.
 
 ### Phase 4 — Search API
 
@@ -516,7 +577,7 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement `/search`.
 - Use Top-3 retrieval.
 - Add optional document filtering.
-- Return source metadata and similarity scores.
+- Return child IDs, parent IDs, source metadata, and child similarity scores.
 - Add retrieval tests.
 
 **Acceptance:** Representative questions retrieve relevant OWASP content.
@@ -526,10 +587,11 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement the configurable LLM client.
 - Implement `/ask`.
 - Build a grounded RAG prompt.
+- Resolve and deduplicate parents, enforce the generation-context budget, and handle missing parents with child-text fallback.
 - Include citations in responses.
 - Handle insufficient context and API failures.
 
-**Acceptance:** The assistant produces source-backed answers using retrieved chunks.
+**Acceptance:** The assistant produces source-backed answers using parent context resolved from child matches, with traceable citations and bounded context.
 
 ### Phase 6 — Evaluation and documentation
 
@@ -550,9 +612,13 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Mock external HTTP and LLM calls in unit tests.
 - Test failed downloads and incomplete files.
 - Test short and oversized Markdown sections.
+- Test parent persistence across restart, non-null parent IDs, and matching parent/child revisions.
+- Test repeated headings, code-fence heading lookalikes, source ranges, and complete embedding-input token limits.
 - Test hashing and deterministic identifiers.
 - Test repeated ingestion and document updates.
+- Test chunking-configuration changes, interrupted parent/child writes, retries, and obsolete-parent cleanup.
 - Test Qdrant retrieval using an isolated test collection.
+- Test Top-3 child semantics, parent deduplication, missing-parent fallback, context budgeting, and citation provenance.
 - Add structured logs for ingestion and retrieval operations.
 - Never commit API keys or other secrets.
 
@@ -582,13 +648,13 @@ The project is complete when:
 
 1. Ten OWASP Markdown files can be downloaded directly from GitHub.
 2. Files are saved under `data/owasp/`.
-3. Markdown-aware chunking works with the selected configuration.
+3. Combined Markdown-aware parent–child chunking works with the selected configuration and persists bounded parents.
 4. Local embeddings are generated successfully.
-5. One Qdrant collection stores all document chunks.
-6. Every point contains document ID, title, filename, source metadata, and hashes.
+5. One Qdrant collection stores all child vectors; the local parent store survives restarts.
+6. Every child point contains a valid parent ID, document ID, title, filename, source metadata, and hashes.
 7. Ingestion is idempotent.
-8. `/search` returns relevant Top-3 chunks.
-9. `/ask` generates grounded answers with citations.
+8. `/search` returns relevant Top-3 child chunks with parent IDs.
+9. `/ask` resolves and deduplicates parents and generates grounded answers with traceable citations within the generation model's context budget.
 10. Retrieval evaluation and tests run successfully.
 11. The README contains installation, usage, architecture, and evaluation instructions.
 
