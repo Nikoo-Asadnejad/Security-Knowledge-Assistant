@@ -1,15 +1,17 @@
 # AI Security Knowledge Assistant
 
 A local RAG assistant that will answer LLM security questions using retrieved OWASP
-documentation, CPU embeddings, Qdrant, and a configurable OpenAI-compatible LLM.
+documentation, CPU embeddings, PostgreSQL for parents, Qdrant for searchable children,
+and a configurable OpenAI-compatible LLM.
 Built with Python 3.12+, uv, and FastAPI.
 
 ## Status
 
 Phases 1 and 2 are implemented: validated settings, local Qdrant through Docker
 Compose, document downloading, metadata extraction, and Markdown-aware parent–child
-chunking with in-memory parents. Embedding, Qdrant ingestion, retrieval, API endpoints,
-answer generation, and evaluation are planned.
+chunking with per-document in-memory parents. Phase 3 will add persistent PostgreSQL
+parent storage, local embeddings, and Qdrant child ingestion. Retrieval, API endpoints,
+answer generation, and evaluation are also planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
@@ -53,6 +55,47 @@ docker compose down
 ```
 
 Stopping the service preserves the volume. Document downloading does not require Qdrant.
+
+## Planned Phase 3 storage
+
+Phase 3 will add PostgreSQL to Docker Compose with a persistent named volume,
+health check, and localhost-only development port. It will introduce `DATABASE_URL`
+configuration, a bounded Psycopg 3 connection pool, and versioned SQL migrations
+applied through an explicit CLI command. PostgreSQL setup and ingestion commands
+will be documented when implemented.
+
+- **PostgreSQL:** Store each parent once with its original text, heading/source
+  metadata, Markdown rendering fields, deterministic ID, and revision hashes.
+  Persist ingestion status and expected parent/child counts alongside the parents.
+- **Qdrant:** Store child embeddings and payloads containing child text, `parent_id`,
+  source metadata, and revision hashes. Parent text is stored in PostgreSQL.
+- **Local Markdown:** Remains the source for ingestion and reprocessing. Retrieving
+  persisted parents after restart will not require rereading or rechunking files.
+
+The ingestion command will process one document at a time and embed children in
+bounded batches. It will commit parents to PostgreSQL before upserting children
+into Qdrant, validate stored references and revisions, remove obsolete children
+before deleting obsolete parents, and mark ingestion complete only after successful
+verification and cleanup. Complete unchanged revisions will be skipped safely.
+Writes across the two databases require retryable steps and durable progress
+tracking. For this local MVP, ingestion will run while the API is stopped; serving
+will resume after ingestion completes successfully.
+
+## Planned retrieval pipeline
+
+Phase 4 will embed the question, retrieve up to 20 child candidates from Qdrant,
+rerank them with the cross-encoder, and return the top three children from `/search`.
+
+In Phase 5, `/ask` will deduplicate those children's parent IDs and fetch the matching
+parents from PostgreSQL in one parameterized batch query. It will preserve the rank
+of each parent's highest-ranked child, validate document/configuration revisions,
+and build the generation context within the LLM's token budget. A request will load
+at most three parents into memory with the selected Top-3 retrieval configuration.
+The application will not load the parent corpus into memory at startup.
+
+Missing or mismatched parent records will use the matching child text as fallback.
+A PostgreSQL lookup failure will be logged and returned as a service-unavailable
+response. Answers will cite only sources included in the generation context.
 
 ## Download OWASP documents
 
@@ -120,12 +163,11 @@ unchanged input reproduces the same identifiers.
 The command prints JSON with document, parent, and child counts, maximum token
 lengths, and hashes. Each document's `parent_chunks` lists parent IDs and texts with
 their child IDs and texts nested under `children`.
-Parents and children remain in memory in the `ChunkedDocument`
-returned by the chunker; the command writes no chunk files. The original Markdown
-files remain the source for rebuilding parents with the same configuration and
-tokenizer. Future answer generation will reconstruct parents from matching local
-sources and use child-text fallback when a matching parent revision is unavailable.
-Vector persistence belongs to Phase 3.
+Parents and children remain in memory in the per-document `ChunkedDocument`
+returned by the chunker. The `chunk` command is a preview: it writes no chunk files
+and does not access PostgreSQL or Qdrant. Phase 3 will add a separate ingestion path
+that persists parents in PostgreSQL and child vectors in Qdrant. Future answer
+generation will fetch matching parents directly from PostgreSQL.
 
 ## Structure and tests
 
@@ -172,7 +214,7 @@ adapted OWASP material.
 - [x] Save the supplied implementation plan under `specs/`.
 - [x] Phase 1: Settings, Docker Compose, document downloads, metadata, and tests.
 - [x] Phase 2: Markdown-aware parent–child chunking and tokenizer validation.
-- [ ] Phase 3: Local embeddings and idempotent Qdrant ingestion.
+- [ ] Phase 3: PostgreSQL parent storage, local embeddings, and idempotent Qdrant child ingestion.
 - [ ] Phase 4: Top-3 semantic search and API.
 - [ ] Phase 5: Grounded answers and source citations.
 - [ ] Phase 6: Evaluation dataset, metrics, tests, and documentation.

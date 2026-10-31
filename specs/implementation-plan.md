@@ -6,7 +6,7 @@ Build a RAG-powered AI Security Knowledge Assistant using the official OWASP Top
 
 The application answers questions about LLM vulnerabilities, security risks, attack scenarios, and mitigations using retrieved OWASP documentation.
 
-**Primary goal:** Learn RAG engineering through practical implementation of document ingestion, Markdown-aware parent–child chunking, embeddings, Qdrant, semantic retrieval, grounded generation, and evaluation.
+**Primary goal:** Learn RAG engineering through practical implementation of document ingestion, Markdown-aware parent–child chunking, embeddings, PostgreSQL parent storage, Qdrant child indexing, semantic retrieval, grounded generation, and evaluation.
 
 Keep the project small, modular, maintainable, and suitable for running locally.
 
@@ -19,6 +19,8 @@ Keep the project small, modular, maintainable, and suitable for running locally.
 | API | FastAPI |
 | Validation | Pydantic v2 |
 | Vector database | Qdrant (Docker) |
+| Parent and ingestion-state database | PostgreSQL (Docker) |
+| PostgreSQL client | Psycopg 3 with connection pooling |
 | Embeddings | FastEmbed — BAAI/bge-small-en-v1.5 |
 | Reranking | Sentence Transformers CrossEncoder — `cross-encoder/ms-marco-MiniLM-L6-v2` |
 | LLM | Configurable OpenAI-compatible API |
@@ -107,7 +109,7 @@ Preserve OWASP attribution and follow the source's CC BY-SA 4.0 license requirem
 
 Implement **Markdown-aware splitting combined with parent–child chunking** as one pipeline. Markdown headings define semantic boundaries; parent–child relationships connect small searchable chunks to larger context units.
 
-Every searchable child chunk must contain a non-null `parent_id` that resolves to an in-memory parent record. A heading path alone does not provide this relationship.
+Every searchable child chunk must contain a non-null `parent_id` that resolves to the corresponding parent record. The chunker validates this relationship within its per-document output; Phase 3 persists parents in PostgreSQL before storing children in Qdrant. A heading path alone does not provide this relationship.
 
 Do not implement fixed-size chunking as a separate strategy or add a strategy selector.
 
@@ -150,7 +152,7 @@ Start with each section immediately beneath the document title, including its in
 - Retain the original heading path and source range on each resulting parent, even when one section produces multiple parents.
 - Do not create empty or heading-only parents. A short section may legitimately produce one parent and one child.
 
-Each parent record has an `id`, `document_id`, `section`, `heading_path`, `text`, `parent_index`, `source_start`, `source_end`, `document_hash`, `parent_hash`, and `chunking_config_hash`, plus the document's title, filename, version, and source metadata. Source ranges are zero-based, half-open character offsets into the decoded original document; `parent_hash` hashes the parent text. Parents are in-memory context records and are not embedded.
+Each parent record has an `id`, `document_id`, `section`, `heading_path`, `text`, `parent_index`, `source_start`, `source_end`, `document_hash`, `parent_hash`, and `chunking_config_hash`, plus the document's title, filename, version, and source metadata. Preserve `markdown_prefix` and `markdown_suffix` needed to restore split tables or code fences when rendering context. Source ranges are zero-based, half-open character offsets into the decoded original document; `parent_hash` hashes the parent text. Parents are context records persisted in PostgreSQL during ingestion and are not embedded.
 
 **Step 3 — Split each parent into searchable children**
 
@@ -201,9 +203,11 @@ Document revisions intentionally create new IDs. Identical content and configura
 
 ### Parent lifecycle
 
-Keep parents in memory as part of the chunker's output. Do not save parent records to files or a database. The `chunk` CLI validates parents and children and prints statistics without writing chunk files.
+The chunker returns parents and children for one document in memory. The `chunk` CLI validates this output and prints statistics without writing chunk files or accessing PostgreSQL or Qdrant. Persistence belongs to the Phase 3 ingestion command.
 
-Keep parent text in one place rather than duplicating it in every child payload. In the answer-generation phase, rebuild parents from the local Markdown documents using the same tokenizer and chunking configuration when needed after restart. Only resolve a child to a parent with matching IDs, document hash, and configuration hash. If matching source or configuration is unavailable, use the child-text fallback in Section 7. No additional storage service or Qdrant collection is required.
+During ingestion, persist each parent once in PostgreSQL before upserting its children into Qdrant. Process documents incrementally and embeddings in bounded batches, releasing per-document chunk records after ingestion; do not retain the entire corpus in application memory. Keep parent text out of child payloads.
+
+At query time, fetch only the parents referenced by the final reranked children, using a single batch lookup in PostgreSQL. Only resolve a child to a parent with matching IDs, document ID, document hash, and configuration hash. After restart, read persisted parents directly; local Markdown and the chunking tokenizer are needed for ingestion or reprocessing, not parent retrieval. Use the child-text fallback in Section 7 for missing or mismatched records. A corpus-wide parent cache is not required.
 
 ### Design references
 
@@ -212,7 +216,20 @@ Keep parent text in one place rather than duplicating it in every child payload.
 - [BAAI model card](https://huggingface.co/BAAI/bge-small-en-v1.5): 384-dimensional embeddings and a 512-token input limit.
 - [Cross-encoder model card](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2): reference implementation and passage-ranking model details.
 
-## 5. Qdrant Vector Storage
+## 5. PostgreSQL Parent Storage and Qdrant Child Storage
+
+### PostgreSQL parent storage
+
+- Add PostgreSQL to Docker Compose with a persistent named volume and a health check. Keep its development port bound to localhost.
+- Configure the connection through `DATABASE_URL`, document it in `.env.example`, and keep credentials out of Git. Use Psycopg 3 with a bounded connection pool and explicit transactions.
+- Provide versioned SQL schema migrations and an explicit CLI command to apply them; do not initialize or migrate the schema during API startup.
+- Store the complete parent record from Section 4 in `parent_chunks`, with `id` as a UUID primary key. Include original text, heading and source metadata, Markdown rendering fields, and revision hashes so context can be rendered without rereading source files.
+- Index `(document_id, document_hash, chunking_config_hash)` for revision checks and cleanup. Use the primary key for batched parent lookups.
+- Store ingestion state in `document_ingestions`, keyed by document ID and revision hashes. Record processing/completed status and expected parent/child counts so incomplete revisions cannot be skipped as unchanged.
+- Parent IDs are immutable revision-specific identifiers. Changed source or configuration produces new rows; unchanged records can be upserted idempotently.
+- Qdrant's `parent_id` is an application-enforced reference to PostgreSQL; a database foreign key cannot enforce it across the two stores.
+
+### Qdrant child storage
 
 Use exactly one Qdrant collection:
 
@@ -224,7 +241,7 @@ Embedding model:
 
 Vector dimensions: 384.
 
-Store only searchable children as vector points. Parent records remain in memory and can be rebuilt from matching local sources as described in Section 4.
+Store only searchable children as vector points. Store parent records in PostgreSQL as described above; do not embed parents or duplicate parent text in Qdrant.
 
 ### Qdrant child point payload
 
@@ -261,16 +278,18 @@ Use the deterministic parent and child UUID rules from Section 4. The Qdrant poi
 
 ### Idempotent ingestion
 
-- Detect whether the document has already been indexed.
+- Detect whether the document has already been indexed using PostgreSQL ingestion state.
 - Compare both `document_hash` and `chunking_config_hash` with the completed ingestion state.
-- Skip documents only when source, configuration, and stored child records are complete and unchanged, and matching parents can be rebuilt from local sources.
+- Skip documents only when source and configuration are unchanged and the expected parent records in PostgreSQL and child records in Qdrant are complete, with matching IDs and revisions. Counts alone do not establish reference integrity.
 - Reprocess changed documents or chunking configurations, including migration from chunks without `parent_id`.
-- Validate child references against the new revision's in-memory parents before upserting child points.
-- After all new child upserts succeed, remove obsolete child points, and only then mark ingestion complete.
+- Validate the per-document parent/child output, then commit the new revision's parents and processing state to PostgreSQL before upserting child points into Qdrant.
+- Validate child references against persisted parents with matching document/configuration revisions. Upsert children in bounded batches using deterministic IDs.
+- After all new child upserts succeed and stored records are verified, remove obsolete child points from Qdrant. Only after their removal succeeds, delete obsolete parent revisions from PostgreSQL and mark the new revision complete in a transaction. Never delete parents while stored children still reference them.
 - Avoid duplicate vectors and stale chunks.
-- Handle failures without incorrectly marking a document as successfully indexed; retries must converge using deterministic IDs. Never resolve children to parents from a different source/configuration revision.
+- PostgreSQL and Qdrant do not share a transaction. Preserve incomplete processing state on failure and make every step retryable, including cleanup; never mark a partially indexed document complete. Parent writes that succeeded before a Qdrant failure can be reused on retry.
+- Never resolve children to parents from a different source/configuration revision.
 
-For the local MVP, run ingestion while the API is stopped. Concurrent reindexing and parent-cache refresh are out of scope.
+For the local MVP, run ingestion while the API is stopped and resume serving only after ingestion completes successfully. Concurrent reindexing and atomic publication across both stores are out of scope.
 
 Keep the Qdrant collection name configurable, but use only one collection for this project.
 
@@ -280,14 +299,15 @@ Use FastEmbed to generate embeddings locally on the CPU.
 
 The ingestion pipeline:
 
-1. Read locally downloaded Markdown files.
+1. Read locally downloaded Markdown files one document at a time.
 2. Parse Markdown headings.
 3. Generate bounded Markdown parents and their searchable children.
 4. Calculate hashes, deterministic IDs, parent links, and source metadata.
 5. Prepare and validate child embedding inputs with contextual headings.
-6. Generate child embeddings in batches; do not embed parents.
-7. Validate in-memory parent references, upsert child points into Qdrant, and complete revision cleanup as specified in Section 5.
-8. Log ingestion statistics.
+6. Validate parent references and persist parents plus processing state in PostgreSQL.
+7. Generate child embeddings in bounded batches; do not embed parents.
+8. Upsert child points into Qdrant, verify persisted parent references and payloads, and complete revision cleanup and PostgreSQL ingestion state as specified in Section 5.
+9. Log ingestion statistics and release per-document chunk records before processing the next document.
 
 The cross-encoder is loaded and used at retrieval time, not during ingestion.
 
@@ -297,6 +317,7 @@ Track:
 - Number of parents and children created
 - Child token lengths and invalid parent-reference failures
 - Embedding duration
+- Parent persistence duration
 - Indexing duration
 - Documents skipped as unchanged
 - Failed documents
@@ -323,13 +344,15 @@ Retrieval configuration:
 
 The cross-encoder score is the final retrieval rank signal; it is not comparable to the Qdrant similarity score and must not be blended unless a later evaluated change specifies normalization and weights. A cross-encoder is query-dependent and cannot be precomputed during ingestion, so load it once per process and reuse it across requests. If reranking fails, log the failure and return the dense candidates only when the API contract explicitly marks the response as degraded; do not silently present dense scores as reranker scores.
 
-For `/ask`, resolve the returned `parent_id` values against in-memory parents rebuilt from matching local sources and use the parents as generation context:
+For `/ask`, fetch the parents referenced by the final reranked children from PostgreSQL and use them as generation context:
 
-- Deduplicate parents while preserving the rank of their highest-scoring matching child.
+- Deduplicate `parent_id` values while preserving the rank of their highest-scoring matching child, then fetch the corresponding rows in one parameterized batch query through the PostgreSQL parent store. Restore retrieval rank explicitly; database row order is not a ranking signal.
+- Validate each fetched parent's ID, document ID, document hash, and configuration hash against its matched children. Load only these parents into request memory; do not rebuild parents from local Markdown or load a corpus-wide parent map at startup.
 - Keep matched child IDs and scores for traceability. Scores belong to child matches, not separately scored parents.
 - Expand only to the immediate parent; do not recursively fetch the whole document or unrelated siblings.
 - Top-3 means the three reranked child hits, which can yield one to three distinct parents. Do not fetch extra hits merely to fill three parents.
 - If a parent is missing or its document/configuration revision differs from the child, log an integrity error and fall back to that child's text. Never substitute content from a different revision.
+- Handle PostgreSQL lookup failures explicitly: log the failure and return a service-unavailable response. Do not treat an unavailable database as an empty lookup or silently hide the outage behind child-text fallback.
 - Enforce the generation model's context budget after reserving space for instructions, the question, formatting, and output. Prefer full parents; when a parent does not fit, use its matching children if they fit. Omit remaining units in rank order rather than silently truncating them, and report insufficient evidence when necessary.
 
 Support optional filtering by `document_id` before reranking.
@@ -351,7 +374,9 @@ Cross-Encoder Reranking (top 20 candidates)
     ↓
 Top-3 Reranked Children
     ↓
-Resolve Parent IDs and Deduplicate Parents
+Deduplicate Parent IDs
+    ↓
+Batch Fetch Parents from PostgreSQL and Validate Revisions
     ↓
 Context Construction
     ↓
@@ -378,7 +403,7 @@ Do not use LangGraph or agents.
 
 ### GET /health
 
-Return service health and Qdrant connection status.
+Return service health and PostgreSQL and Qdrant connection status. Report an unavailable required store as unhealthy.
 
 ### POST /search
 
@@ -446,7 +471,8 @@ Provide commands for:
 
 - Downloading the Markdown documents
 - Refreshing downloaded documents
-- Ingesting documents into Qdrant
+- Applying PostgreSQL schema migrations
+- Ingesting parents into PostgreSQL and child vectors into Qdrant
 - Printing ingestion statistics
 - Running evaluation
 
@@ -521,6 +547,8 @@ ai-security-rag/
 │       │   └── embedder.py
 │       ├── vector_store/
 │       │   └── qdrant_store.py
+│       ├── parent_store/
+│       │   └── postgres_store.py
 │       ├── rag/
 │       │   ├── retriever.py
 │       │   ├── reranker.py
@@ -536,6 +564,8 @@ ai-security-rag/
 ├── evaluation/
 │   └── questions.json
 ├── tests/
+├── migrations/
+│   └── 001_parent_storage.sql
 ├── compose.yaml
 ├── pyproject.toml
 ├── uv.lock
@@ -567,24 +597,28 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement conditional overlap of up to 60 tokens within an oversized section and parent.
 - Add document title and heading context to embedding text.
 - Implement parent/child hashing, configuration hashing, and deterministic parent/child IDs.
-- Keep parent records in memory without saving chunk files.
+- Return per-document parent records in memory without saving chunk files; database persistence is introduced in Phase 3.
 - Validate chunk sizes using the embedding tokenizer.
 - Test relative heading levels, repeated headings, introductory text, short/long sections, oversized parents, lists, tables, and code fences.
 - Test that every child resolves to the correct parent and that overlap never crosses parent or heading boundaries.
 
 **Acceptance:** Every child preserves useful semantic context, respects the complete-input token budget, and resolves to one in-memory parent from the same document/configuration revision. Parents preserve source content within the parent token limit. The chunk command writes no parent or child files.
 
-### Phase 3 — Embeddings and Qdrant
+### Phase 3 — Embeddings, PostgreSQL parents, and Qdrant children
 
+- Add PostgreSQL to Docker Compose with persistent storage, health checks, `DATABASE_URL` settings, and documented setup.
+- Add Psycopg 3, bounded connection pooling, and versioned SQL schema migrations with an explicit migration CLI command.
+- Implement the PostgreSQL parent store and durable ingestion state, preserving complete parent metadata and revision hashes.
+- Provide batched parent lookup by ID for the later retrieval pipeline, with matching-revision validation and no corpus-wide parent loading.
 - Initialize FastEmbed.
-- Generate child embeddings locally.
+- Process one document at a time, persist its parents in PostgreSQL, and generate child embeddings locally in bounded batches.
 - Create the Qdrant collection.
-- Store points and metadata.
+- Store child vectors, text, parent IDs, and source/revision metadata in Qdrant.
 - Implement deterministic point IDs.
-- Implement incremental, idempotent ingestion with parent-reference validation and obsolete-child cleanup.
-- Verify stored payloads.
+- Implement incremental, idempotent ingestion with persisted parent-reference validation, recovery from partial writes across both stores, obsolete-child cleanup before obsolete-parent deletion, and completion tracking.
+- Verify PostgreSQL parent records, Qdrant payloads, and persistence across application restarts.
 
-**Acceptance:** All ten OWASP documents are indexed without duplicates or dangling parent references; stored child points contain parent IDs, titles, filenames, hashes, and source links, and unchanged complete revisions can be skipped safely.
+**Acceptance:** All ten OWASP documents have parents persisted in PostgreSQL and searchable children indexed in Qdrant without duplicates or dangling parent references. Stored child points contain parent IDs, titles, filenames, hashes, and source links. Matching parents can be fetched in a batch after an application restart without source reconstruction or loading all parents into memory. Unchanged complete revisions are skipped safely, and retries recover from partial PostgreSQL/Qdrant writes and cleanup failures.
 
 ### Phase 4 — Search API
 
@@ -603,9 +637,9 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement the configurable LLM client.
 - Implement `/ask`.
 - Build a grounded RAG prompt.
-- Rebuild parents from matching local sources, resolve and deduplicate them, enforce the generation-context budget, and handle missing parents with child-text fallback.
+- Deduplicate final child hits by parent ID, batch-fetch matching parents from PostgreSQL, preserve retrieval rank, enforce the generation-context budget, and handle missing or mismatched parents with child-text fallback.
 - Include citations in responses.
-- Handle insufficient context and API failures.
+- Handle insufficient context, PostgreSQL lookup failures, and LLM API failures explicitly.
 
 **Acceptance:** The assistant produces source-backed answers using parent context resolved from child matches, with traceable citations and bounded context.
 
@@ -628,13 +662,16 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Mock external HTTP and LLM calls in unit tests.
 - Test failed downloads and incomplete files.
 - Test short and oversized Markdown sections.
-- Test in-memory parent resolution, non-null parent IDs, matching parent/child revisions, and deterministic reconstruction from unchanged local sources.
+- Test per-document chunker parent resolution, non-null parent IDs, matching parent/child revisions, and deterministic chunking from unchanged local sources.
+- Test PostgreSQL parent round trips, preserved Markdown rendering metadata, batched ID lookups, schema migrations, and ingestion-state persistence.
+- Verify parent lookup after restarting the application without local source reconstruction or loading the complete parent corpus.
 - Test repeated headings, code-fence heading lookalikes, source ranges, and complete embedding-input token limits.
 - Test hashing and deterministic identifiers.
 - Test repeated ingestion and document updates.
-- Test chunking-configuration changes, interrupted child upserts, retries, and obsolete-child cleanup.
+- Test chunking-configuration changes, failed parent transactions, interrupted child upserts, retries, cleanup failures, obsolete-child removal before obsolete-parent deletion, and completion only after both stores are consistent.
 - Test Qdrant retrieval using an isolated test collection.
-- Test Top-3 child semantics, parent deduplication, missing-parent fallback, context budgeting, and citation provenance.
+- Use an isolated PostgreSQL test database/schema for integration tests; keep unit tests independent of running databases.
+- Test Top-3 child semantics, one batched PostgreSQL parent fetch, preserved ranking, parent deduplication, missing/mismatched-parent fallback, explicit PostgreSQL outage handling, context budgeting, and citation provenance.
 - Test candidate-pool limits, reranker ordering and tie-breaking, reranker input limits, model-load reuse, and explicit degraded behavior when reranking fails.
 - Add structured logs for ingestion and retrieval operations.
 - Never commit API keys or other secrets.
@@ -664,13 +701,13 @@ The project is complete when:
 
 1. Ten OWASP Markdown files can be downloaded directly from GitHub.
 2. Files are saved under `data/owasp/`.
-3. Combined Markdown-aware parent–child chunking works with the selected configuration and produces bounded in-memory parents.
+3. Combined Markdown-aware parent–child chunking works with the selected configuration and produces bounded per-document parents and children.
 4. Local embeddings are generated successfully.
-5. One Qdrant collection stores all child vectors; matching parents can be rebuilt from local sources after restart, with child-text fallback when unavailable.
+5. PostgreSQL durably stores parents and ingestion state; one Qdrant collection stores child vectors. Parents can be fetched by ID after restart without rebuilding them from local sources or retaining the corpus in memory.
 6. Every child point contains a valid parent ID, document ID, title, filename, source metadata, and hashes.
-7. Ingestion is idempotent.
+7. Ingestion is idempotent across PostgreSQL and Qdrant, with safe cleanup ordering and recovery from partial failures.
 8. `/search` retrieves up to 20 dense candidates, reranks them with the cross-encoder, and returns the relevant Top-3 child chunks with both scores and parent IDs.
-9. `/ask` resolves and deduplicates parents and generates grounded answers with traceable citations within the generation model's context budget.
+9. `/ask` deduplicates parent IDs, batch-fetches matching parents from PostgreSQL in retrieval rank order, and generates grounded answers with traceable citations within the generation model's context budget. Missing or mismatched parents use child-text fallback; database outages are reported explicitly.
 10. Retrieval evaluation and tests run successfully.
 11. The README contains installation, usage, architecture, and evaluation instructions.
 
