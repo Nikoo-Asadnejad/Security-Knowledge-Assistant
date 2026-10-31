@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-security_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-security_rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_storage:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
   qdrant:
     image: qdrant/qdrant:v1.19.2
     ports:
@@ -8,4 +25,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres_storage:
   qdrant_storage:

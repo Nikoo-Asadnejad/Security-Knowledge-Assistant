@@ -18,4 +18,5 @@ data/owasp/*
 !data/owasp/.gitkeep
 evaluation/results/
 qdrant_storage/
+data/models/
 .DS_Store
