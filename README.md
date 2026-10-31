@@ -1,16 +1,18 @@
 # AI Security Knowledge Assistant
 
 A local RAG assistant that will answer LLM security questions using retrieved OWASP
-documentation, CPU embeddings, PostgreSQL for parents, Qdrant for searchable children,
-and a configurable OpenAI-compatible LLM.
+documentation, dense + BM25 hybrid retrieval, and a configurable OpenAI-compatible
+LLM. It uses local CPU embeddings, PostgreSQL for parents, and Qdrant for searchable
+children.
 Built with Python 3.12+, uv, and FastAPI.
 
 ## Status
 
 Phases 1–3 are implemented: document downloading, Markdown-aware parent–child
 chunking, persistent PostgreSQL parents and ingestion state, local CPU embeddings,
-and retryable Qdrant child indexing. Retrieval, API endpoints, answer generation,
-and evaluation are planned.
+and retryable Qdrant child indexing with dense vectors. Phase 4 will add BM25 sparse
+vectors to every child point; Phase 5 will implement hybrid retrieval and `/search`.
+Answer generation (Phase 6) and evaluation (Phase 7) are also planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
@@ -120,14 +122,64 @@ or reconstructing parents from Markdown.
 `PostgresStore.resolve_parents()` accepts requested parent IDs with document/hash/config
 revisions and uses one batched primary-key query. It excludes missing or mismatched
 parents and works with a new connection pool after restart, without local source files,
-a tokenizer, or a corpus-wide parent cache. Retrieval will use this in Phase 5.
+a tokenizer, or a corpus-wide parent cache. Answer generation will use this in Phase 6.
+
+## Planned Phase 4: BM25 sparse indexing
+
+Every searchable child point will keep its existing unnamed 384-dimensional dense
+vector and gain a named `bm25` sparse vector in the same Qdrant collection. Parents
+remain in PostgreSQL. An explicit offline backfill will update existing points in
+bounded, retryable batches, preserving dense vectors, IDs, text, and parent links.
+Subsequent ingestion will generate both representations. These capabilities and
+their CLI/settings are planned; the current `ingest` command still writes dense vectors only.
+
+The selected approach is local FastEmbed `Qdrant/bm25` with Qdrant's IDF modifier.
+Use document `embed()` for child vectors and `query_embed()` for questions; let Qdrant
+apply IDF once. Sparse vectors store term indices and weights, with no fixed dense
+dimension. See the [BM25 model card](https://huggingface.co/Qdrant/bm25).
+
+The implementation will follow these practices:
+
+- Index each child's code, title, heading path, and body once. Keep UUIDs, hashes,
+  URLs, and full parent text out of lexical input.
+- Share versioned lexical preprocessing between indexing and queries. Start with
+  case-insensitive matching and stemming/bundled stopwords disabled for technical
+  terms. Check punctuation, digits, and long-token handling in the actual encoder.
+- Test codes such as `LLM01`, `CWE-79`, `ERR_CONNECTION_RESET`, and `0x80070005`.
+  Use deterministic aliases for punctuated codes and canonical `identifiers`
+  keyword metadata for explicitly requested exact filtering. Ordinary BM25 ranking
+  does not guarantee exact string, phrase, or substring matching.
+- Start with `k=1.2`, `b=0.75`, and a measured, frozen average lexical child length.
+  Version these choices in `sparse_config_hash`, separately from chunk revisions.
+  Changed lexical settings require sparse re-encoding; unchanged dense vectors and
+  parent IDs can be reused. Missing/stale sparse vectors prevent an unchanged skip.
+- Verify sparse coverage and durable completion before serving hybrid requests.
+  Keep the API stopped during backfill, as with existing ingestion.
+
+Qdrant now recommends payload full-text BM25 when supported, but its scoring feature
+requires v1.20.0; this project pins v1.19.2. Sparse BM25 fits that version and the
+requirement to store a sparse vector on each point. A text filter alone does not
+provide BM25 ranking on the pinned version. See [Qdrant sparse text search](https://qdrant.tech/documentation/search/text-search/sparse-vector-search/)
+and [BM25 scoring requirements](https://qdrant.tech/documentation/manage-data/indexing/#bm25-scoring).
 
 ## Planned retrieval pipeline
 
-Phase 4 will embed the question, retrieve up to 20 child candidates from Qdrant,
-rerank them with the cross-encoder, and return the top three children from `/search`.
+Phase 5 will encode the question for dense semantic search and BM25 lexical search,
+prefetch up to 20 children from each branch, and fuse their rankings with reciprocal
+rank fusion (RRF). The union can contain up to 40 children; fusion will retain at most
+20 for cross-encoder reranking, and `/search` will return the top three children.
+Apply the same optional document or explicit exact-identifier filter to both branches
+before their candidate limits. [Qdrant's Query API supports prefetch and RRF fusion](https://qdrant.tech/documentation/search/hybrid-queries/).
 
-In Phase 5, `/ask` will deduplicate those children's parent IDs and fetch the matching
+Dense retrieval covers semantic paraphrases; BM25 supplies lexical evidence for
+specific keywords and codes present in the indexed content or metadata. RRF combines
+ranks because dense and BM25 scores have different scales. Responses will distinguish
+fusion scores from reranker scores; raw branch scores/ranks will be nullable unless
+collected. Empty lexical matches can use an explicit `dense_only` mode; encoder/store
+failures and incomplete sparse indexing will return an error. A reranker fallback
+must be explicitly marked as degraded.
+
+In Phase 6, `/ask` will deduplicate those children's parent IDs and fetch the matching
 parents from PostgreSQL in one parameterized batch query. It will preserve the rank
 of each parent's highest-ranked child, validate document/configuration revisions,
 and build the generation context within the LLM's token budget. A request will load
@@ -137,6 +189,13 @@ The application will not load the parent corpus into memory at startup.
 Missing or mismatched parent records will use the matching child text as fallback.
 A PostgreSQL lookup failure will be logged and returned as a service-unavailable
 response. Answers will cite only sources included in the generation context.
+
+Phase 7 will compare dense-only, BM25-only, fused, and reranked results on the same
+labeled questions, including code/keyword cases and semantic paraphrases. It will
+measure candidate recall, final Recall@3/MRR@3, exact-code hit rate, context quality,
+and stage timings. Synthetic error codes belong in isolated tests; retrieval cannot
+supply error-code documentation absent from the OWASP corpus. The full defaults,
+backfill acceptance criteria, and failure behavior are in the implementation plan.
 
 ## Download OWASP documents
 
@@ -274,9 +333,10 @@ adapted OWASP material.
 - [x] Phase 1: Settings, Docker Compose, document downloads, metadata, and tests.
 - [x] Phase 2: Markdown-aware parent–child chunking and tokenizer validation.
 - [x] Phase 3: PostgreSQL parent storage, local embeddings, and idempotent Qdrant child ingestion.
-- [ ] Phase 4: Top-3 semantic search and API.
-- [ ] Phase 5: Grounded answers and source citations.
-- [ ] Phase 6: Evaluation dataset, metrics, tests, and documentation.
+- [ ] Phase 4: BM25 sparse vectors on every child point and retryable backfill.
+- [ ] Phase 5: Dense + BM25 hybrid retrieval, RRF, reranking, and Top-3 search API.
+- [ ] Phase 6: Grounded answers and source citations.
+- [ ] Phase 7: Evaluation dataset, metrics, tests, and documentation.
 
 Implementation will follow the plan's package structure as each capability is
 added. OWASP content must retain its attribution and comply with its source license.
