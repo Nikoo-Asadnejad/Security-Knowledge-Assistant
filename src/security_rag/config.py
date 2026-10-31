@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     download_retries: int = Field(default=2, ge=0, le=5)
     qdrant_url: HttpUrl = HttpUrl("http://localhost:6333")
     qdrant_collection: NonEmptyString = "owasp_security_2026"
+    database_url: SecretStr = SecretStr("")
+    database_pool_size: int = Field(default=4, ge=1, le=16)
+    database_timeout_seconds: float = Field(default=10, gt=0, allow_inf_nan=False)
+    ingestion_batch_size: int = Field(default=32, ge=1, le=256)
+    embedding_cache_dir: Path = Path("data/models")
     embedding_model: NonEmptyString = "BAAI/bge-small-en-v1.5"
     tokenizer_path: Path | None = None
     tokenizer_revision: NonEmptyString = "main"

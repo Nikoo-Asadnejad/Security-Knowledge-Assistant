@@ -7,11 +7,10 @@ Built with Python 3.12+, uv, and FastAPI.
 
 ## Status
 
-Phases 1 and 2 are implemented: validated settings, local Qdrant through Docker
-Compose, document downloading, metadata extraction, and Markdown-aware parent–child
-chunking with per-document in-memory parents. Phase 3 will add persistent PostgreSQL
-parent storage, local embeddings, and Qdrant child ingestion. Retrieval, API endpoints,
-answer generation, and evaluation are also planned.
+Phases 1–3 are implemented: document downloading, Markdown-aware parent–child
+chunking, persistent PostgreSQL parents and ingestion state, local CPU embeddings,
+and retryable Qdrant child indexing. Retrieval, API endpoints, answer generation,
+and evaluation are planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
@@ -29,57 +28,99 @@ uv run ruff format --check .
 ```
 
 Run commands from the project root. Settings load from `.env`; environment variables
-take precedence. Keep secrets in `.env`. LLM credentials are optional for Phases 1 and 2.
+take precedence. Keep secrets in `.env`. LLM credentials are optional through Phase 3.
 
 The settings in `.env.example` configure the download directory, per-request timeout,
 retry count, Qdrant URL and collection, embedding model, and OpenAI-compatible LLM.
 `DOWNLOAD_RETRIES` is the number of retries after the initial attempt (default 2,
 maximum 5). `DOWNLOAD_TIMEOUT_SECONDS` must be positive (default 30).
 
-## Local Qdrant
+## Local PostgreSQL and Qdrant
 
-Start Docker, then run:
+After copying `.env.example` to `.env`, set `POSTGRES_PASSWORD` to a local password
+and set `DATABASE_URL` to `postgresql://security_rag:<password>@localhost:5432/security_rag`.
+URL-encode special characters in the URL password. A generated hexadecimal password
+avoids that encoding step. Keep both values in the ignored `.env`, out of Git.
+`POSTGRES_USER` and `POSTGRES_DB` default to `security_rag`; keep the URL consistent
+if you change them. PostgreSQL initialization settings apply when its volume is first created.
+
+Start Docker, then run from the project root:
 
 ```sh
-docker compose up -d qdrant
+docker compose up -d --wait
 curl --fail http://localhost:6333/readyz
+uv run security-rag migrate
 ```
 
-Compose pins Qdrant to version 1.19.2, exposes its HTTP interface only on localhost,
-and persists storage in a Docker named volume. The dashboard is available at
+Compose uses PostgreSQL 17 and Qdrant 1.19.2. Both ports bind only to localhost
+(PostgreSQL 5432, Qdrant HTTP 6333); both stores use persistent named volumes.
+PostgreSQL has a readiness health check. The Qdrant dashboard is available at
 [localhost:6333/dashboard](http://localhost:6333/dashboard).
-Collection creation and indexing are part of Phase 3.
+
+`migrate` explicitly applies the versioned SQL in `migrations/` transactionally and
+records checksums in `schema_migrations`. Repeating it is safe; changing an applied
+migration is rejected. Add a new migration for subsequent schema changes.
+Importing the application and running other commands never migrate the schema.
+The Psycopg 3 pool is bounded by `DATABASE_POOL_SIZE` (default 4, maximum 16);
+`DATABASE_TIMEOUT_SECONDS` bounds connection acquisition and SQL statements.
 
 ```sh
 docker compose down
 ```
 
-Stopping the service preserves the volume. Document downloading does not require Qdrant.
+Stopping services preserves their named volumes. Downloading and previewing chunks
+require neither database.
 
-## Planned Phase 3 storage
+## Ingest documents
 
-Phase 3 will add PostgreSQL to Docker Compose with a persistent named volume,
-health check, and localhost-only development port. It will introduce `DATABASE_URL`
-configuration, a bounded Psycopg 3 connection pool, and versioned SQL migrations
-applied through an explicit CLI command. PostgreSQL setup and ingestion commands
-will be documented when implemented.
+With both stores running and migrations applied:
 
-- **PostgreSQL:** Store each parent once with its original text, heading/source
-  metadata, Markdown rendering fields, deterministic ID, and revision hashes.
-  Persist ingestion status and expected parent/child counts alongside the parents.
-- **Qdrant:** Store child embeddings and payloads containing child text, `parent_id`,
-  source metadata, and revision hashes. Parent text is stored in PostgreSQL.
-- **Local Markdown:** Remains the source for ingestion and reprocessing. Retrieving
-  persisted parents after restart will not require rereading or rechunking files.
+```sh
+uv run security-rag download
+uv run security-rag ingest
+uv run security-rag stats
+```
 
-The ingestion command will process one document at a time and embed children in
-bounded batches. It will commit parents to PostgreSQL before upserting children
-into Qdrant, validate stored references and revisions, remove obsolete children
-before deleting obsolete parents, and mark ingestion complete only after successful
-verification and cleanup. Complete unchanged revisions will be skipped safely.
-Writes across the two databases require retryable steps and durable progress
-tracking. For this local MVP, ingestion will run while the API is stopped; serving
-will resume after ingestion completes successfully.
+Keep the API stopped throughout ingestion, including retries. Resume serving only
+after ingestion succeeds. Concurrent reindexing and atomic publication across the
+two stores are outside this local MVP's scope.
+
+The command processes one document at a time. It commits that revision's parents and
+`processing` state to PostgreSQL before embedding and upserting children in bounded
+batches (`INGESTION_BATCH_SIZE`, default 32, maximum 256). FastEmbed loads
+`BAAI/bge-small-en-v1.5` once, on CPU, only when embeddings are needed. The first run
+downloads model weights into the ignored `EMBEDDING_CACHE_DIR` (default `data/models`).
+Only this 384-dimensional model is supported for Phase 3. Chunking and runtime
+tokenizers must match; exact embedding inputs are checked without truncation.
+
+PostgreSQL stores each complete parent, including original text, source ranges,
+headings, Markdown rendering fields, and revision hashes. Qdrant's single configured
+collection stores searchable children with deterministic point IDs, their text,
+`parent_id`, and source/revision metadata. Parent text is never copied into child payloads.
+
+A completed revision is skipped only when source/configuration hashes, expected
+counts, actual parent IDs and metadata, child IDs and payloads, and persisted parent
+references match. Missing or damaged records cause reprocessing. After upserts and
+verification, obsolete children are deleted and their absence is verified; only
+then are obsolete parents deleted and the new revision marked `completed` in one
+PostgreSQL transaction. Old-format child points for the document are cleaned up too.
+
+A failed command exits nonzero and prints a report identifying failed files and
+error types. Successfully written parents, children, and durable processing state
+remain available. Rerun `ingest` after resolving the failure: deterministic upserts
+and cleanup steps can be retried, and completed intact documents are skipped.
+The two stores do not share a transaction.
+
+Successful ingestion prints JSON containing processed/skipped/failed document counts,
+parent/child counts, child token-length ranges, and embedding, parent-persistence,
+and indexing durations. JSON ingestion events go to stderr. `stats` reads persisted
+revision status, expected counts, and the Qdrant point count without loading models
+or reconstructing parents from Markdown.
+
+`PostgresStore.resolve_parents()` accepts requested parent IDs with document/hash/config
+revisions and uses one batched primary-key query. It excludes missing or mismatched
+parents and works with a new connection pool after restart, without local source files,
+a tokenizer, or a corpus-wide parent cache. Retrieval will use this in Phase 5.
 
 ## Planned retrieval pipeline
 
@@ -165,9 +206,9 @@ lengths, and hashes. Each document's `parent_chunks` lists parent IDs and texts 
 their child IDs and texts nested under `children`.
 Parents and children remain in memory in the per-document `ChunkedDocument`
 returned by the chunker. The `chunk` command is a preview: it writes no chunk files
-and does not access PostgreSQL or Qdrant. Phase 3 will add a separate ingestion path
-that persists parents in PostgreSQL and child vectors in Qdrant. Future answer
-generation will fetch matching parents directly from PostgreSQL.
+and does not access PostgreSQL or Qdrant. Use `ingest` to persist parents in
+PostgreSQL and child vectors in Qdrant. Future answer generation will fetch matching
+parents directly from PostgreSQL.
 
 ## Structure and tests
 
@@ -185,7 +226,10 @@ metadata and hashing, the manifest, skip/refresh behavior, retries, invalid/inco
 downloads, preservation of existing files, and CLI success/failure behavior. Chunking
 tests cover relative/repeated headings, introductions, long sections, lists, tables,
 fences, Unicode, source ranges, overlap boundaries, hashes, deterministic IDs, parent
-links, and validation without writing chunk files.
+links, and validation without writing chunk files. Ingestion tests use an isolated
+in-memory Qdrant collection and a transactional parent-store stand-in. They cover
+unchanged skips, damaged records, source/configuration changes, interrupted writes,
+invalid persisted references, cleanup ordering, and retry recovery.
 
 Run the optional acceptance checks with the real model tokenizer and local corpus:
 
@@ -197,6 +241,21 @@ These checks verify complete-input budgets, source coverage, deterministic outpu
 and in-memory parent resolution for all ten files, plus oversized structured blocks.
 They perform no network calls and are skipped without `TEST_TOKENIZER_PATH`; corpus
 cases also require the downloaded Markdown files.
+
+Run PostgreSQL integration tests against the local development database:
+
+```sh
+# Use the same local connection URL as DATABASE_URL (do not commit it).
+TEST_DATABASE_URL='<local PostgreSQL URL>' uv run pytest -q tests/test_postgres_store.py
+# Optional: include checks against a live Qdrant instance.
+TEST_QDRANT_URL=http://localhost:6333 uv run pytest -q tests/test_qdrant_live.py
+```
+
+PostgreSQL tests create and remove a unique disposable schema for each case, leaving
+application tables untouched. They verify migrations and rollback, parent round trips,
+Markdown fields, batched lookup from a fresh pool, ingestion-state persistence, and
+recovery after partial child writes. Qdrant tests create and remove an isolated test
+collection. Both integrations are opt-in; default unit tests require no services.
 
 ## OWASP attribution
 
@@ -214,7 +273,7 @@ adapted OWASP material.
 - [x] Save the supplied implementation plan under `specs/`.
 - [x] Phase 1: Settings, Docker Compose, document downloads, metadata, and tests.
 - [x] Phase 2: Markdown-aware parent–child chunking and tokenizer validation.
-- [ ] Phase 3: PostgreSQL parent storage, local embeddings, and idempotent Qdrant child ingestion.
+- [x] Phase 3: PostgreSQL parent storage, local embeddings, and idempotent Qdrant child ingestion.
 - [ ] Phase 4: Top-3 semantic search and API.
 - [ ] Phase 5: Grounded answers and source citations.
 - [ ] Phase 6: Evaluation dataset, metrics, tests, and documentation.

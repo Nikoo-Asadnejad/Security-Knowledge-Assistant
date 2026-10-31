@@ -33,6 +33,13 @@ def test_environment_overrides_dotenv(settings, monkeypatch):
     assert "local-secret" not in loaded.model_dump_json()
 
 
+def test_database_url_is_not_serialized_in_reports(settings, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:private-password@localhost/db")
+    loaded = Settings()
+    assert "private-password" not in repr(loaded)
+    assert "private-password" not in loaded.model_dump_json()
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -46,6 +53,12 @@ def test_environment_overrides_dotenv(settings, monkeypatch):
         {"qdrant_collection": " "},
         {"embedding_model": ""},
         {"tokenizer_revision": " "},
+        {"database_pool_size": 0},
+        {"database_pool_size": 17},
+        {"database_timeout_seconds": 0},
+        {"database_timeout_seconds": float("inf")},
+        {"ingestion_batch_size": 0},
+        {"ingestion_batch_size": 257},
     ],
 )
 def test_invalid_settings_are_rejected(settings, values):

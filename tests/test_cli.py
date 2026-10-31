@@ -8,7 +8,18 @@ from security_rag.cli import main
 from security_rag.ingestion.downloader import DownloadError, DownloadReport
 
 
-@pytest.mark.parametrize("arguments", [[], ["--help"], ["download", "--help"], ["chunk", "--help"]])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--help"],
+        ["download", "--help"],
+        ["chunk", "--help"],
+        ["migrate", "--help"],
+        ["ingest", "--help"],
+        ["stats", "--help"],
+    ],
+)
 def test_help_needs_no_settings_or_network(settings, monkeypatch, capsys, arguments):
     monkeypatch.setenv("QDRANT_URL", "invalid")
     monkeypatch.setattr(sys, "argv", ["security-rag", *arguments])
@@ -18,9 +29,8 @@ def test_help_needs_no_settings_or_network(settings, monkeypatch, capsys, argume
         assert exc.value.code == 0
     else:
         main()
-    assert (
-        "chunk" if arguments and arguments[0] == "chunk" else "download"
-    ) in capsys.readouterr().out
+    command = arguments[0] if arguments and arguments[0] != "--help" else "download"
+    assert command in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("refresh", [False, True])
@@ -125,3 +135,34 @@ def test_invalid_tokenizer_exits_without_traceback(
         main()
     assert exc.value.code == 1
     assert "Chunking failed: Could not load tokenizer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["migrate", "ingest", "stats"])
+def test_storage_commands_print_json(settings, monkeypatch, capsys, command):
+    monkeypatch.setattr(sys, "argv", ["security-rag", command])
+    with patch("security_rag.cli.storage_command", return_value={"ok": True}) as run:
+        main()
+    assert run.call_args.args[0] == command
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+
+
+def test_ingestion_failure_prints_report_and_nonzero_status(settings, monkeypatch, capsys):
+    from security_rag.ingestion.pipeline import IngestionError, IngestionReport
+
+    monkeypatch.setattr(sys, "argv", ["security-rag", "ingest"])
+    report = IngestionReport(failed=1, failures=[{"file_name": "bad.md", "error": "ValueError"}])
+    with patch("security_rag.cli.storage_command", side_effect=IngestionError(report)):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out)["failed"] == 1
+    assert "IngestionError" in output.err
+
+
+def test_database_error_does_not_disclose_credentials(settings, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["security-rag", "migrate"])
+    with patch("security_rag.cli.storage_command", side_effect=RuntimeError("secret-password")):
+        with pytest.raises(SystemExit):
+            main()
+    assert "secret-password" not in capsys.readouterr().err

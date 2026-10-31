@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import logging
+from contextlib import closing
 from importlib.metadata import version
 
 from security_rag.config import Settings
@@ -15,20 +17,68 @@ def main() -> None:
     download = commands.add_parser("download", help="Download the ten OWASP Markdown documents")
     download.add_argument("--refresh", action="store_true", help="Replace existing documents")
     commands.add_parser("chunk", help="Validate local document chunks and print statistics")
+    commands.add_parser("migrate", help="Apply versioned PostgreSQL schema migrations")
+    commands.add_parser(
+        "ingest", help="Persist parents and embed/index children (API must be stopped)"
+    )
+    commands.add_parser("stats", help="Print persisted ingestion state and collection counts")
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         return
     try:
         settings = Settings()
-        if args.command == "chunk":
+        if args.command in {"migrate", "ingest", "stats"}:
+            logging.basicConfig(level=logging.INFO, format="%(message)s")
+            logging.getLogger("httpx").setLevel(logging.WARNING)
+            print(json.dumps(storage_command(args.command, settings), indent=2, default=str))
+        elif args.command == "chunk":
             print(json.dumps(chunk_documents(settings), indent=2))
         else:
             report = download_documents(settings, refresh=args.refresh)
             print(report.model_dump_json(indent=2))
     except (DownloadError, OSError, ValueError) as exc:
-        label = "Chunking" if args.command == "chunk" else "Download"
+        label = {"chunk": "Chunking", "download": "Download"}.get(
+            args.command, args.command.title()
+        )
+        if args.command in {"migrate", "ingest", "stats"}:
+            # Driver messages and configuration values must not disclose credentials.
+            parser.exit(1, f"{label} failed ({type(exc).__name__}); check settings and services.\n")
         parser.exit(1, f"{label} failed: {exc}\n")
+    except Exception as exc:
+        from security_rag.ingestion.pipeline import IngestionError
+
+        if isinstance(exc, IngestionError):
+            print(exc.report.model_dump_json(indent=2))
+        parser.exit(
+            1,
+            f"{args.command.title()} failed ({type(exc).__name__}); "
+            "check services and rerun the command.\n",
+        )
+
+
+def storage_command(command: str, settings: Settings) -> dict:
+    from security_rag.parent_store.postgres_store import PostgresStore
+
+    if command == "ingest":
+        from security_rag.ingestion.pipeline import ingest_documents
+
+        return ingest_documents(settings).model_dump()
+    parents = PostgresStore.from_settings(settings)
+    try:
+        if command == "migrate":
+            return {"applied": parents.migrate()}
+        from qdrant_client import QdrantClient
+
+        from security_rag.vector_store.qdrant_store import QdrantStore
+
+        with closing(QdrantClient(url=str(settings.qdrant_url), timeout=30)) as client:
+            return {
+                "ingestions": parents.statistics(),
+                "qdrant": QdrantStore(client, settings.qdrant_collection).statistics(),
+            }
+    finally:
+        parents.close()
 
 
 def chunk_documents(settings: Settings) -> dict:
