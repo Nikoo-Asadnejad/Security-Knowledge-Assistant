@@ -16,6 +16,64 @@ Answer generation (Phase 6) and evaluation (Phase 7) are also planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
+## Pipeline flow
+
+### Ingestion
+
+The offline pipeline processes one document at a time. Dense indexing is implemented;
+the dashed BM25 step and dual-vector verification are planned for Phase 4. Existing
+points will receive their sparse vectors through the planned backfill.
+
+```mermaid
+flowchart TD
+    source["Ten allowlisted OWASP Markdown files"] --> download["Download and validate<br/>Preserve original files and source hashes"]
+    download --> chunk["Markdown-aware parent–child chunking<br/>Headings, token budgets, deterministic IDs"]
+    chunk --> check{"Completed revision and<br/>required stored records verified?"}
+    check -->|Yes| skip["Skip unchanged document"]
+    check -->|No| parents[("PostgreSQL<br/>Persist parents and processing state")]
+    parents --> batch["Validate persisted parent references<br/>Prepare child inputs in bounded batches"]
+    batch --> dense["FastEmbed dense vectors<br/>BAAI/bge-small-en-v1.5"]
+    batch --> sparse["Phase 4: BM25 sparse vectors<br/>Shared lexical preprocessing"]
+    dense --> points[("Qdrant: one child collection<br/>Dense + BM25 vectors, child text,<br/>parent IDs and source metadata")]
+    sparse --> points
+    points --> verify["Verify required vectors, payloads<br/>and parent references"]
+    verify --> cleanup["Delete obsolete children and verify removal<br/>Then delete obsolete parents"]
+    cleanup --> complete[("PostgreSQL<br/>Mark revision completed")]
+
+    classDef planned stroke-dasharray: 5 5
+    class sparse planned
+```
+
+Parents supply answer context; only children receive embeddings. PostgreSQL parent
+writes precede Qdrant child writes, and incomplete ingestion remains retryable.
+
+### Retrieval and answers
+
+Phase 5 will implement hybrid retrieval and `/search`; Phase 6 will add parent
+expansion and `/ask`. The cross-encoder reranks the fused candidates before either
+response path.
+
+```mermaid
+flowchart TD
+    question["User question"] --> dense["Dense query embedding<br/>Same model as ingestion"]
+    question --> sparse["BM25 query encoding<br/>Same lexical preprocessing as ingestion"]
+    dense --> semantic["Qdrant dense search<br/>Up to 20 child hits"]
+    sparse --> lexical["Qdrant BM25 search with IDF<br/>Up to 20 child hits"]
+    filters["Optional document or explicit<br/>exact-identifier filter"] -.-> semantic
+    filters -.-> lexical
+    semantic --> fusion["Reciprocal rank fusion<br/>Up to 20 unique child candidates"]
+    lexical --> fusion
+    fusion --> rerank["Cross-encoder reranking<br/>ms-marco-MiniLM-L6-v2"]
+    rerank --> top["Top 3 children"]
+    top --> search["/search<br/>Child text, scores and source metadata"]
+    top --> deduplicate["/ask: deduplicate parent IDs<br/>Preserve retrieval rank"]
+    deduplicate --> parents[("PostgreSQL<br/>One batch lookup of matching parents")]
+    parents --> validate["Validate parent IDs and revision hashes<br/>Use child text for missing or mismatched parents"]
+    validate --> context["Build context within the LLM token budget"]
+    context --> llm["Configurable LLM<br/>Generate a grounded answer"]
+    llm --> answer["Answer with citations<br/>Only sources included in context"]
+```
+
 ## Development setup
 
 Install Python 3.12+ and uv, then run:
