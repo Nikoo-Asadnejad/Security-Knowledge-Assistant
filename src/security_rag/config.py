@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     qdrant_url: HttpUrl = HttpUrl("http://localhost:6333")
     qdrant_collection: NonEmptyString = "owasp_security_2026"
     embedding_model: NonEmptyString = "BAAI/bge-small-en-v1.5"
+    tokenizer_path: Path | None = None
+    tokenizer_revision: NonEmptyString = "main"
     llm_base_url: HttpUrl = HttpUrl("https://api.openai.com/v1")
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""

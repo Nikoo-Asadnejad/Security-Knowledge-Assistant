@@ -6,11 +6,12 @@ Built with Python 3.12+, uv, and FastAPI.
 
 ## Status
 
-Phase 1 is implemented: validated settings, local Qdrant through Docker Compose,
-document downloading, metadata extraction, and SHA-256 hashing. Chunking, ingestion,
-retrieval, API endpoints, answer generation, and evaluation are planned.
+Phases 1 and 2 are implemented: validated settings, local Qdrant through Docker
+Compose, document downloading, metadata extraction, and Markdown-aware parent–child
+chunking with in-memory parents. Embedding, Qdrant ingestion, retrieval, API endpoints,
+answer generation, and evaluation are planned.
 
-The complete supplied plan is preserved in [specs/implementation-plan.md](specs/implementation-plan.md).
+The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
 ## Development setup
 
@@ -26,7 +27,7 @@ uv run ruff format --check .
 ```
 
 Run commands from the project root. Settings load from `.env`; environment variables
-take precedence. Keep secrets in `.env`. LLM credentials are optional for Phase 1.
+take precedence. Keep secrets in `.env`. LLM credentials are optional for Phases 1 and 2.
 
 The settings in `.env.example` configure the download directory, per-request timeout,
 retry count, Qdrant URL and collection, embedding model, and OpenAI-compatible LLM.
@@ -82,17 +83,78 @@ all ten documents: document ID, code, title, filename, version, local path, orig
 GitHub URL, and SHA-256 of the original bytes. Metadata is derived from the local files
 each time, rather than stored in sidecar files. No Git commit SHA is recorded.
 
-## Phase 1 structure and tests
+## Chunk local documents
+
+After downloading the ten documents, run:
+
+```sh
+uv run security-rag chunk
+```
+
+The command loads the embedding model's tokenizer on demand. The first run may
+download `tokenizer.json` from Hugging Face; it does not download embedding weights.
+For offline use, set `TOKENIZER_PATH` to a local copy of the matching
+`BAAI/bge-small-en-v1.5` tokenizer. `TOKENIZER_REVISION` selects the Hugging Face
+revision when no local path is supplied. Tokenizer contents are included in the
+configuration hash, so changed tokenizer artifacts create distinct chunk revisions.
+
+ATX headings define section boundaries relative to the document title, including
+titles at `##`. A source-position scanner preserves original whitespace, repeated
+heading occurrences, introductory content, and heading-like lines inside fences.
+Oversized units use LangChain's token-aware `RecursiveCharacterTextSplitter` with
+`split_documents`; source slices, IDs, and parent relationships remain explicit.
+
+Parents contain at most 1,200 tokens including heading context. Children contain at
+most 450 tokens for the **complete embedding input**, including the document/section
+prefix, restored table headers or code fences, and special tokens. Counting uses the
+matching tokenizer with truncation and padding disabled. Fitting Markdown blocks
+remain intact; oversized blocks split at natural boundaries, then token offsets.
+Original text and source ranges remain separate from restored Markdown syntax.
+
+Parents never overlap or combine unrelated sections. Only children from the same
+oversized heading unit and parent can overlap, by up to 60 tokens; overlap shrinks
+when required to fit. Every child carries a deterministic UUIDv5 `parent_id`.
+Source, parent, child, and canonical configuration hashes distinguish revisions;
+unchanged input reproduces the same identifiers.
+
+The command prints JSON with document, parent, and child counts, maximum token
+lengths, and hashes. Each document's `parent_chunks` lists parent IDs and texts with
+their child IDs and texts nested under `children`.
+Parents and children remain in memory in the `ChunkedDocument`
+returned by the chunker; the command writes no chunk files. The original Markdown
+files remain the source for rebuilding parents with the same configuration and
+tokenizer. Future answer generation will reconstruct parents from matching local
+sources and use child-text fallback when a matching parent revision is unavailable.
+Vector persistence belongs to Phase 3.
+
+## Structure and tests
 
 `config.py` owns settings. `ingestion/manifest.py` defines the source allowlist,
 `ingestion/downloader.py` handles HTTP and safe persistence, and `ingestion/loader.py`
 validates local Markdown and derives document metadata. The CLI coordinates these
-operations. Importing the package does not download documents or initialize models.
+operations. `ingestion/markdown.py` tracks Markdown structure and source positions;
+`chunker.py`, `chunk_models.py`, and `tokenizer.py` implement bounded chunks, metadata,
+and token counting. Importing the package does not download documents or initialize
+models.
 
 Unit tests use temporary directories and mocked HTTP responses; they need neither
 network access nor Docker, model downloads, or LLM credentials. They cover settings,
 metadata and hashing, the manifest, skip/refresh behavior, retries, invalid/incomplete
-downloads, preservation of existing files, and CLI success/failure behavior.
+downloads, preservation of existing files, and CLI success/failure behavior. Chunking
+tests cover relative/repeated headings, introductions, long sections, lists, tables,
+fences, Unicode, source ranges, overlap boundaries, hashes, deterministic IDs, parent
+links, and validation without writing chunk files.
+
+Run the optional acceptance checks with the real model tokenizer and local corpus:
+
+```sh
+TEST_TOKENIZER_PATH=/absolute/path/to/tokenizer.json uv run pytest -q
+```
+
+These checks verify complete-input budgets, source coverage, deterministic output,
+and in-memory parent resolution for all ten files, plus oversized structured blocks.
+They perform no network calls and are skipped without `TEST_TOKENIZER_PATH`; corpus
+cases also require the downloaded Markdown files.
 
 ## OWASP attribution
 
@@ -109,7 +171,7 @@ adapted OWASP material.
 - [x] Initialize the Python package, dependency lock, and development tooling.
 - [x] Save the supplied implementation plan under `specs/`.
 - [x] Phase 1: Settings, Docker Compose, document downloads, metadata, and tests.
-- [ ] Phase 2: Markdown-aware chunking with tokenizer validation.
+- [x] Phase 2: Markdown-aware parent–child chunking and tokenizer validation.
 - [ ] Phase 3: Local embeddings and idempotent Qdrant ingestion.
 - [ ] Phase 4: Top-3 semantic search and API.
 - [ ] Phase 5: Grounded answers and source citations.

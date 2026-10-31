@@ -107,7 +107,7 @@ Preserve OWASP attribution and follow the source's CC BY-SA 4.0 license requirem
 
 Implement **Markdown-aware splitting combined with parent–child chunking** as one pipeline. Markdown headings define semantic boundaries; parent–child relationships connect small searchable chunks to larger context units.
 
-Every searchable child chunk must contain a non-null `parent_id` that resolves to a stored parent. A heading path alone does not provide this relationship.
+Every searchable child chunk must contain a non-null `parent_id` that resolves to an in-memory parent record. A heading path alone does not provide this relationship.
 
 Do not implement fixed-size chunking as a separate strategy or add a strategy selector.
 
@@ -150,7 +150,7 @@ Start with each section immediately beneath the document title, including its in
 - Retain the original heading path and source range on each resulting parent, even when one section produces multiple parents.
 - Do not create empty or heading-only parents. A short section may legitimately produce one parent and one child.
 
-Each stored parent has an `id`, `document_id`, `section`, `heading_path`, `text`, `parent_index`, `source_start`, `source_end`, `document_hash`, `parent_hash`, and `chunking_config_hash`, plus the document's title, filename, version, and source metadata. Source ranges are zero-based, half-open character offsets into the decoded original document; `parent_hash` hashes the stored parent text. Parents are context records and are not embedded.
+Each parent record has an `id`, `document_id`, `section`, `heading_path`, `text`, `parent_index`, `source_start`, `source_end`, `document_hash`, `parent_hash`, and `chunking_config_hash`, plus the document's title, filename, version, and source metadata. Source ranges are zero-based, half-open character offsets into the decoded original document; `parent_hash` hashes the parent text. Parents are in-memory context records and are not embedded.
 
 **Step 3 — Split each parent into searchable children**
 
@@ -187,7 +187,7 @@ Use `MarkdownHeaderTextSplitter` for heading metadata where appropriate and a to
 **Step 5 — Assign identifiers and hashes**
 
 - `document_hash`: SHA-256 of the complete original source file bytes.
-- `parent_hash`: SHA-256 of the UTF-8 stored parent text.
+- `parent_hash`: SHA-256 of the UTF-8 parent text.
 - `chunk_hash`: SHA-256 of the UTF-8 stored child text, excluding the contextual embedding prefix.
 - `chunking_config_hash`: SHA-256 of canonical configuration including algorithm version, heading rules, parent/child limits, overlap, embedding model/tokenizer identity, and embedding-prefix format.
 
@@ -199,11 +199,11 @@ Generate deterministic UUIDs with a fixed UUIDv5 namespace:
 
 Document revisions intentionally create new IDs. Identical content and configuration must reproduce the same IDs; duplicate headings or repeated text at different positions must not collide.
 
-### Parent storage
+### Parent lifecycle
 
-Persist parents separately from child vectors. For this ten-document local MVP, use a configurable `data/parents/` directory with one JSON file per document revision/configuration, containing parent records keyed by `id`. Use atomic file replacement. The API must load these records after restart; an ingestion-only in-memory map is insufficient.
+Keep parents in memory as part of the chunker's output. Do not save parent records to files or a database. The `chunk` CLI validates parents and children and prints statistics without writing chunk files.
 
-Keep parent text in one place rather than duplicating it in every child payload. No additional database service or Qdrant collection is required. See Section 5 for coordinated ingestion and cleanup.
+Keep parent text in one place rather than duplicating it in every child payload. In the answer-generation phase, rebuild parents from the local Markdown documents using the same tokenizer and chunking configuration when needed after restart. Only resolve a child to a parent with matching IDs, document hash, and configuration hash. If matching source or configuration is unavailable, use the child-text fallback in Section 7. No additional storage service or Qdrant collection is required.
 
 ### Design references
 
@@ -224,7 +224,7 @@ Embedding model:
 
 Vector dimensions: 384.
 
-Store only searchable children as vector points. Parent records live in the local parent store described in Section 4.
+Store only searchable children as vector points. Parent records remain in memory and can be rebuilt from matching local sources as described in Section 4.
 
 ### Qdrant child point payload
 
@@ -262,15 +262,15 @@ Use the deterministic parent and child UUID rules from Section 4. The Qdrant poi
 ### Idempotent ingestion
 
 - Detect whether the document has already been indexed.
-- Compare both `document_hash` and `chunking_config_hash` with the completed ingestion state, and verify that the parent store is available.
-- Skip documents only when source, configuration, and stored parent/child records are complete and unchanged.
+- Compare both `document_hash` and `chunking_config_hash` with the completed ingestion state.
+- Skip documents only when source, configuration, and stored child records are complete and unchanged, and matching parents can be rebuilt from local sources.
 - Reprocess changed documents or chunking configurations, including migration from chunks without `parent_id`.
-- Validate parent references and persist the new revision's parent file before upserting its child points. Retain previous parent files while their children still exist.
-- After all new child upserts succeed, remove obsolete child points, then delete unreferenced parent revisions, and only then mark ingestion complete.
+- Validate child references against the new revision's in-memory parents before upserting child points.
+- After all new child upserts succeed, remove obsolete child points, and only then mark ingestion complete.
 - Avoid duplicate vectors and stale chunks.
-- Handle failures without incorrectly marking a document as successfully indexed; retries must converge using deterministic IDs. Never delete parents still referenced by stored children.
+- Handle failures without incorrectly marking a document as successfully indexed; retries must converge using deterministic IDs. Never resolve children to parents from a different source/configuration revision.
 
-For the local MVP, run ingestion while the API is stopped. Atomic visibility across the filesystem and Qdrant during concurrent reindexing is out of scope.
+For the local MVP, run ingestion while the API is stopped. Concurrent reindexing and parent-cache refresh are out of scope.
 
 Keep the Qdrant collection name configurable, but use only one collection for this project.
 
@@ -286,7 +286,7 @@ The ingestion pipeline:
 4. Calculate hashes, deterministic IDs, parent links, and source metadata.
 5. Prepare and validate child embedding inputs with contextual headings.
 6. Generate child embeddings in batches; do not embed parents.
-7. Persist parent records, upsert child points into Qdrant, and complete revision cleanup as specified in Section 5.
+7. Validate in-memory parent references, upsert child points into Qdrant, and complete revision cleanup as specified in Section 5.
 8. Log ingestion statistics.
 
 The cross-encoder is loaded and used at retrieval time, not during ingestion.
@@ -323,11 +323,11 @@ Retrieval configuration:
 
 The cross-encoder score is the final retrieval rank signal; it is not comparable to the Qdrant similarity score and must not be blended unless a later evaluated change specifies normalization and weights. A cross-encoder is query-dependent and cannot be precomputed during ingestion, so load it once per process and reuse it across requests. If reranking fails, log the failure and return the dense candidates only when the API contract explicitly marks the response as degraded; do not silently present dense scores as reranker scores.
 
-For `/ask`, resolve the returned `parent_id` values in the persistent parent store and use the parents as generation context:
+For `/ask`, resolve the returned `parent_id` values against in-memory parents rebuilt from matching local sources and use the parents as generation context:
 
 - Deduplicate parents while preserving the rank of their highest-scoring matching child.
 - Keep matched child IDs and scores for traceability. Scores belong to child matches, not separately scored parents.
-- Expand only to the immediate stored parent; do not recursively fetch the whole document or unrelated siblings.
+- Expand only to the immediate parent; do not recursively fetch the whole document or unrelated siblings.
 - Top-3 means the three reranked child hits, which can yield one to three distinct parents. Do not fetch extra hits merely to fill three parents.
 - If a parent is missing or its document/configuration revision differs from the child, log an integrity error and fall back to that child's text. Never substitute content from a different revision.
 - Enforce the generation model's context budget after reserving space for instructions, the question, formatting, and output. Prefer full parents; when a parent does not fit, use its matching children if they fit. Omit remaining units in rank order rather than silently truncating them, and report insufficient evidence when necessary.
@@ -516,7 +516,6 @@ ai-security-rag/
 │       │   ├── downloader.py
 │       │   ├── loader.py
 │       │   ├── chunker.py
-│       │   ├── parent_store.py
 │       │   └── pipeline.py
 │       ├── embeddings/
 │       │   └── embedder.py
@@ -533,8 +532,7 @@ ai-security-rag/
 │       ├── config.py
 │       └── cli.py
 ├── data/
-│   ├── owasp/
-│   └── parents/
+│   └── owasp/
 ├── evaluation/
 │   └── questions.json
 ├── tests/
@@ -569,12 +567,12 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement conditional overlap of up to 60 tokens within an oversized section and parent.
 - Add document title and heading context to embedding text.
 - Implement parent/child hashing, configuration hashing, and deterministic parent/child IDs.
-- Implement persistent parent storage with atomic file replacement and loading after restart.
+- Keep parent records in memory without saving chunk files.
 - Validate chunk sizes using the embedding tokenizer.
 - Test relative heading levels, repeated headings, introductory text, short/long sections, oversized parents, lists, tables, and code fences.
 - Test that every child resolves to the correct parent and that overlap never crosses parent or heading boundaries.
 
-**Acceptance:** Every child preserves useful semantic context, respects the complete-input token budget, and resolves to one persisted parent from the same document/configuration revision. Parents preserve source content within the parent token limit.
+**Acceptance:** Every child preserves useful semantic context, respects the complete-input token budget, and resolves to one in-memory parent from the same document/configuration revision. Parents preserve source content within the parent token limit. The chunk command writes no parent or child files.
 
 ### Phase 3 — Embeddings and Qdrant
 
@@ -583,7 +581,7 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Create the Qdrant collection.
 - Store points and metadata.
 - Implement deterministic point IDs.
-- Implement incremental, idempotent ingestion with coordinated parent/child updates and obsolete-revision cleanup.
+- Implement incremental, idempotent ingestion with parent-reference validation and obsolete-child cleanup.
 - Verify stored payloads.
 
 **Acceptance:** All ten OWASP documents are indexed without duplicates or dangling parent references; stored child points contain parent IDs, titles, filenames, hashes, and source links, and unchanged complete revisions can be skipped safely.
@@ -605,7 +603,7 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Implement the configurable LLM client.
 - Implement `/ask`.
 - Build a grounded RAG prompt.
-- Resolve and deduplicate parents, enforce the generation-context budget, and handle missing parents with child-text fallback.
+- Rebuild parents from matching local sources, resolve and deduplicate them, enforce the generation-context budget, and handle missing parents with child-text fallback.
 - Include citations in responses.
 - Handle insufficient context and API failures.
 
@@ -630,11 +628,11 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Mock external HTTP and LLM calls in unit tests.
 - Test failed downloads and incomplete files.
 - Test short and oversized Markdown sections.
-- Test parent persistence across restart, non-null parent IDs, and matching parent/child revisions.
+- Test in-memory parent resolution, non-null parent IDs, matching parent/child revisions, and deterministic reconstruction from unchanged local sources.
 - Test repeated headings, code-fence heading lookalikes, source ranges, and complete embedding-input token limits.
 - Test hashing and deterministic identifiers.
 - Test repeated ingestion and document updates.
-- Test chunking-configuration changes, interrupted parent/child writes, retries, and obsolete-parent cleanup.
+- Test chunking-configuration changes, interrupted child upserts, retries, and obsolete-child cleanup.
 - Test Qdrant retrieval using an isolated test collection.
 - Test Top-3 child semantics, parent deduplication, missing-parent fallback, context budgeting, and citation provenance.
 - Test candidate-pool limits, reranker ordering and tie-breaking, reranker input limits, model-load reuse, and explicit degraded behavior when reranking fails.
@@ -666,9 +664,9 @@ The project is complete when:
 
 1. Ten OWASP Markdown files can be downloaded directly from GitHub.
 2. Files are saved under `data/owasp/`.
-3. Combined Markdown-aware parent–child chunking works with the selected configuration and persists bounded parents.
+3. Combined Markdown-aware parent–child chunking works with the selected configuration and produces bounded in-memory parents.
 4. Local embeddings are generated successfully.
-5. One Qdrant collection stores all child vectors; the local parent store survives restarts.
+5. One Qdrant collection stores all child vectors; matching parents can be rebuilt from local sources after restart, with child-text fallback when unavailable.
 6. Every child point contains a valid parent ID, document ID, title, filename, source metadata, and hashes.
 7. Ingestion is idempotent.
 8. `/search` retrieves up to 20 dense candidates, reranks them with the cross-encoder, and returns the relevant Top-3 child chunks with both scores and parent IDs.

@@ -10,6 +10,8 @@ def test_defaults_need_no_llm_credentials(settings):
     assert settings.qdrant_collection == "owasp_security_2026"
     assert str(settings.qdrant_url) == "http://localhost:6333/"
     assert settings.embedding_model == "BAAI/bge-small-en-v1.5"
+    assert settings.tokenizer_path is None
+    assert settings.tokenizer_revision == "main"
     assert settings.llm_api_key.get_secret_value() == ""
     assert settings.llm_model == ""
     assert Settings().data_dir == Path("data/owasp")
@@ -43,6 +45,7 @@ def test_environment_overrides_dotenv(settings, monkeypatch):
         {"llm_base_url": "ftp://example.com"},
         {"qdrant_collection": " "},
         {"embedding_model": ""},
+        {"tokenizer_revision": " "},
     ],
 )
 def test_invalid_settings_are_rejected(settings, values):
