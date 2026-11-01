@@ -117,12 +117,23 @@ Compose uses PostgreSQL 17 and Qdrant 1.19.2. Both ports bind only to localhost
 PostgreSQL has a readiness health check. The Qdrant dashboard is available at
 [localhost:6333/dashboard](http://localhost:6333/dashboard).
 
-`migrate` explicitly applies the versioned SQL in `migrations/` transactionally and
-records checksums in `schema_migrations`. Repeating it is safe; changing an applied
-migration is rejected. Add a new migration for subsequent schema changes.
+`migrate` explicitly applies Alembic's versioned Python migrations in
+`src/security_rag/parent_store/migrations/versions/` transactionally and records the
+current revision in `alembic_version`. Repeating it is safe. Keep applied revisions
+unchanged and add a new revision for subsequent schema changes. Migration definitions
+are frozen separately from the application's current SQLAlchemy table definitions.
+An existing database with the original `001_parent_storage.sql` checksum is adopted
+without recreating tables or changing parent data; its historical `schema_migrations`
+table is retained. Unknown or modified legacy migrations are rejected.
 Importing the application and running other commands never migrate the schema.
-The Psycopg 3 pool is bounded by `DATABASE_POOL_SIZE` (default 4, maximum 16);
-`DATABASE_TIMEOUT_SECONDS` bounds connection acquisition and SQL statements.
+PostgreSQL access uses SQLAlchemy Core expressions with the Psycopg 3 driver;
+application queries and migrations contain no handwritten SQL. Pydantic chunk models
+remain independent of persistence definitions. Each store owns a SQLAlchemy engine
+with a pool bounded by `DATABASE_POOL_SIZE` (default 4, maximum 16), no overflow
+connections, and connection health checks. `DATABASE_TIMEOUT_SECONDS` sets the pool
+acquisition, connection establishment, and statement timeouts. Budget connections
+across every worker and replica; each process has its own pool. Write operations use
+explicit transactions, with connections released before embedding or Qdrant calls.
 
 ```sh
 docker compose down
@@ -369,9 +380,10 @@ TEST_QDRANT_URL=http://localhost:6333 uv run pytest -q tests/test_qdrant_live.py
 ```
 
 PostgreSQL tests create and remove a unique disposable schema for each case, leaving
-application tables untouched. They verify migrations and rollback, parent round trips,
-Markdown fields, batched lookup from a fresh pool, ingestion-state persistence, and
-recovery after partial child writes. Qdrant tests create and remove an isolated test
+application tables untouched. They verify migrations and rollback, legacy-schema
+adoption, pool limits and statement timeouts, parent round trips, Markdown fields,
+batched lookup from a fresh pool, ingestion-state persistence, and recovery after
+partial child writes. Qdrant tests create and remove an isolated test
 collection. Both integrations are opt-in; default unit tests require no services.
 
 ## OWASP attribution

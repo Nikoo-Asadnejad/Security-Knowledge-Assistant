@@ -20,7 +20,8 @@ Keep the project small, modular, maintainable, and suitable for running locally.
 | Validation | Pydantic v2 |
 | Vector database | Qdrant (Docker) |
 | Parent and ingestion-state database | PostgreSQL (Docker) |
-| PostgreSQL client | Psycopg 3 with connection pooling |
+| PostgreSQL access | SQLAlchemy Core with Psycopg 3 and bounded connection pooling |
+| Schema migrations | Alembic Python revisions |
 | Dense embeddings | FastEmbed — BAAI/bge-small-en-v1.5 |
 | Lexical sparse embeddings | FastEmbed — `Qdrant/bm25`, with Qdrant IDF |
 | Candidate fusion | Reciprocal rank fusion (RRF) |
@@ -224,8 +225,8 @@ At query time, fetch only the parents referenced by the final reranked children,
 ### PostgreSQL parent storage
 
 - Add PostgreSQL to Docker Compose with a persistent named volume and a health check. Keep its development port bound to localhost.
-- Configure the connection through `DATABASE_URL`, document it in `.env.example`, and keep credentials out of Git. Use Psycopg 3 with a bounded connection pool and explicit transactions.
-- Provide versioned SQL schema migrations and an explicit CLI command to apply them; do not initialize or migrate the schema during API startup.
+- Configure the connection through `DATABASE_URL`, document it in `.env.example`, and keep credentials out of Git. Use SQLAlchemy Core with the Psycopg 3 driver, a bounded SQLAlchemy connection pool, and explicit transactions. Keep persistence definitions independent of Pydantic chunk models and use SQLAlchemy expressions instead of handwritten SQL.
+- Provide versioned Alembic Python schema migrations and an explicit CLI command to apply them; do not initialize or migrate the schema during API startup. Adopt the original SQL-migrated schema only after validating its recorded checksum, preserving existing parent data.
 - Store the complete parent record from Section 4 in `parent_chunks`, with `id` as a UUID primary key. Include original text, heading and source metadata, Markdown rendering fields, and revision hashes so context can be rendered without rereading source files.
 - Index `(document_id, document_hash, chunking_config_hash)` for revision checks and cleanup. Use the primary key for batched parent lookups.
 - Store ingestion state in `document_ingestions`, keyed by document ID and revision hashes. Record processing/completed status and expected parent/child counts so incomplete revisions cannot be skipped as unchanged.
@@ -597,7 +598,13 @@ ai-security-rag/
 │       ├── vector_store/
 │       │   └── qdrant_store.py
 │       ├── parent_store/
-│       │   └── postgres_store.py
+│       │   ├── postgres_store.py
+│       │   ├── schema.py
+│       │   ├── migration_runner.py
+│       │   └── migrations/
+│       │       ├── env.py
+│       │       └── versions/
+│       │           └── 001_parent_storage.py
 │       ├── rag/
 │       │   ├── retriever.py
 │       │   ├── reranker.py
@@ -613,8 +620,6 @@ ai-security-rag/
 ├── evaluation/
 │   └── questions.json
 ├── tests/
-├── migrations/
-│   └── 001_parent_storage.sql
 ├── compose.yaml
 ├── pyproject.toml
 ├── uv.lock
@@ -656,7 +661,7 @@ Avoid unnecessary layers, patterns, and abstractions.
 ### Phase 3 — Embeddings, PostgreSQL parents, and Qdrant children
 
 - Add PostgreSQL to Docker Compose with persistent storage, health checks, `DATABASE_URL` settings, and documented setup.
-- Add Psycopg 3, bounded connection pooling, and versioned SQL schema migrations with an explicit migration CLI command.
+- Add SQLAlchemy Core with Psycopg 3, bounded connection pooling, and versioned Alembic Python schema migrations with an explicit migration CLI command.
 - Implement the PostgreSQL parent store and durable ingestion state, preserving complete parent metadata and revision hashes.
 - Provide batched parent lookup by ID for the later retrieval pipeline, with matching-revision validation and no corpus-wide parent loading.
 - Initialize FastEmbed.
