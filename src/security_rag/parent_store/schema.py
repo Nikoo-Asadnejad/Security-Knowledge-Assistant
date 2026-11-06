@@ -13,7 +13,7 @@ from sqlalchemy import (
     Uuid,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 metadata = MetaData()
 REVISION_COLUMNS = ("document_id", "document_hash", "chunking_config_hash")
@@ -25,12 +25,24 @@ document_ingestions = Table(
     Column("status", Text, nullable=False),
     Column("expected_parents", Integer, nullable=False),
     Column("expected_children", Integer, nullable=False),
+    Column("sparse_config_hash", Text),
+    Column("sparse_status", Text, nullable=False, server_default="processing"),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+sparse_configuration = Table(
+    "sparse_configuration",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("config", JSONB, nullable=False),
+    CheckConstraint("id = 1"),
 )
 for expression in (
     document_ingestions.c.status.in_(("processing", "completed")),
     document_ingestions.c.expected_parents > 0,
     document_ingestions.c.expected_children > 0,
+    document_ingestions.c.sparse_status.in_(("processing", "completed")),
+    (document_ingestions.c.sparse_status != "completed")
+    | document_ingestions.c.sparse_config_hash.is_not(None),
 ):
     document_ingestions.append_constraint(CheckConstraint(expression))
 

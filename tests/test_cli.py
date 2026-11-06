@@ -166,3 +166,10 @@ def test_database_error_does_not_disclose_credentials(settings, monkeypatch, cap
         with pytest.raises(SystemExit):
             main()
     assert "secret-password" not in capsys.readouterr().err
+
+
+def test_removed_backfill_command_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["security-rag", "backfill-sparse"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2

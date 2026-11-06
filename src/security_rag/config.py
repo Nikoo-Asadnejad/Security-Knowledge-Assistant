@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     ingestion_batch_size: int = Field(default=32, ge=1, le=256)
     embedding_cache_dir: Path = Path("data/models")
     embedding_model: NonEmptyString = "BAAI/bge-small-en-v1.5"
+    bm25_k: float = Field(default=1.2, gt=0, allow_inf_nan=False)
+    bm25_b: float = Field(default=0.75, ge=0, le=1, allow_inf_nan=False)
+    bm25_token_max_length: int = Field(default=512, ge=40, le=8192)
     tokenizer_path: Path | None = None
     tokenizer_revision: NonEmptyString = "main"
     llm_base_url: HttpUrl = HttpUrl("https://api.openai.com/v1")

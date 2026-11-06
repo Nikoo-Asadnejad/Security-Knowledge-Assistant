@@ -73,8 +73,10 @@ def storage_command(command: str, settings: Settings) -> dict:
         from security_rag.vector_store.qdrant_store import QdrantStore
 
         with closing(QdrantClient(url=str(settings.qdrant_url), timeout=30)) as client:
+            sparse_config = parents.sparse_config()
             return {
                 "ingestions": parents.statistics(),
+                "sparse_configuration": sparse_config.model_dump() if sparse_config else None,
                 "qdrant": QdrantStore(client, settings.qdrant_collection).statistics(),
             }
     finally:

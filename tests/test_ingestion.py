@@ -2,7 +2,6 @@ import copy
 import json
 from contextlib import closing
 from unittest.mock import patch
-from uuid import uuid4
 
 import pytest
 from qdrant_client import QdrantClient, models
@@ -21,12 +20,20 @@ class MemoryParents:
         self.parents = {}
         self.states = {}
         self.events = []
+        self.config = None
 
     def ingestion_state(self, revision):
         return self.states.get(revision.key)
 
     def prepare_revision(self, chunks):
         revision = document_revision(chunks)
+        existing_ids = {revision.document_id} | {
+            p.document_id
+            for p in self.parents.values()
+            if p.file_name == chunks.parents[0].file_name
+        }
+        if any(key[0] in existing_ids and key != revision.key for key in self.states):
+            raise ValueError("Document updates are deferred to Phase 8")
         self.events.append("prepare")
         self.states[revision.key] = {
             "status": "processing",
@@ -35,24 +42,12 @@ class MemoryParents:
         }
         self.parents.update({p.id: p for p in chunks.parents})
 
-    def verify_parents(self, chunks, *, all_revisions=False, allow_extra=False):
+    def verify_parents(self, chunks):
         revision = document_revision(chunks)
         actual = {
-            key: parent
-            for key, parent in self.parents.items()
-            if (
-                (
-                    parent.document_id == revision.document_id
-                    or parent.file_name == chunks.parents[0].file_name
-                )
-                if all_revisions
-                else Revision.of(parent) == revision
-            )
+            key: parent for key, parent in self.parents.items() if Revision.of(parent) == revision
         }
-        expected = {p.id: p for p in chunks.parents}
-        if allow_extra:
-            actual = {key: value for key, value in actual.items() if key in expected}
-        return actual == expected
+        return actual == {p.id: p for p in chunks.parents}
 
     def resolve_parents(self, references):
         return {
@@ -62,25 +57,28 @@ class MemoryParents:
             and Revision.of(self.parents[ref.parent_id]).key == ref.key
         }
 
-    def finish_revision(self, chunks):
-        revision = document_revision(chunks)
+    def finish_revision(self, chunks, sparse_config_hash):
         self.events.append("finish")
-        document_ids = {revision.document_id} | {
-            parent.document_id
-            for parent in self.parents.values()
-            if parent.file_name == chunks.parents[0].file_name
-        }
-        self.parents = {
-            key: parent
-            for key, parent in self.parents.items()
-            if parent.document_id not in document_ids or key in {p.id for p in chunks.parents}
-        }
-        self.states = {
-            key: state
+        self.states[document_revision(chunks).key].update(
+            status="completed", sparse_status="completed", sparse_config_hash=sparse_config_hash
+        )
+
+    def sparse_config(self):
+        return self.config
+
+    def save_sparse_config(self, config):
+        if self.config is not None and self.config != config:
+            raise ValueError("Sparse configuration updates are deferred to Phase 8")
+        self.config = config
+
+    def statistics(self):
+        return [
+            dict(
+                zip(("document_id", "document_hash", "chunking_config_hash"), key, strict=True),
+                **state,
+            )
             for key, state in self.states.items()
-            if key[0] not in document_ids or key == revision.key
-        }
-        self.states[revision.key]["status"] = "completed"
+        ]
 
 
 class FakeEmbedder:
@@ -100,13 +98,18 @@ class FakeEmbedder:
 
 
 @pytest.fixture
-def pipeline(tokenizer):
+def pipeline(tokenizer, sparse_encoder):
     parents = MemoryParents()
     with closing(QdrantClient(":memory:")) as client:
         children = QdrantStore(client, "isolated_test", batch_size=2)
         children.ensure_collection()
         yield IngestionPipeline(
-            MarkdownChunker(tokenizer), parents, children, FakeEmbedder(parents, 2), batch_size=2
+            MarkdownChunker(tokenizer),
+            parents,
+            children,
+            FakeEmbedder(parents, 2),
+            sparse_encoder,
+            batch_size=2,
         )
 
 
@@ -118,147 +121,73 @@ def source(make_document):
     )
 
 
-def test_repeated_ingestion_checks_references_and_skips_without_embedding(pipeline, source):
+def test_ingestion_writes_both_vectors_on_every_run_without_duplicates(pipeline, source):
     first = pipeline.ingest_document(source)
     calls = pipeline.embedder.calls
     second = pipeline.ingest_document(source)
-    assert first.parents == 2 and first.children == 3
-    assert not first.skipped and second.skipped
-    assert pipeline.embedder.calls == calls
+    assert first.parents == second.parents == 2
+    assert first.children == second.children == 3
+    assert pipeline.embedder.calls == 2 * calls
     assert pipeline.children.statistics()["children"] == 3
     chunks = pipeline.chunker.chunk(source)
-    assert pipeline.parents.verify_parents(chunks, all_revisions=True)
-    assert pipeline.children.verify_children(chunks, all_revisions=True)
-    record = pipeline.children.client.retrieve(
-        "isolated_test", [str(chunks.children[0].id)], with_payload=True
-    )[0]
-    assert record.payload == chunks.children[0].model_dump(mode="json")
-    assert "parent_hash" not in record.payload
-
-
-@pytest.mark.parametrize("damage", ["parent_id", "id", "hash", "missing", "parent", "counts"])
-def test_counts_alone_never_allow_a_damaged_revision_to_skip(pipeline, source, damage):
-    pipeline.ingest_document(source)
-    chunks = pipeline.chunker.chunk(source)
-    child = chunks.children[0]
-    if damage == "parent":
-        pipeline.parents.parents.pop(child.parent_id)
-    elif damage == "counts":
-        pipeline.parents.states[Revision.of(child).key]["expected_children"] += 1
-    elif damage == "missing":
-        pipeline.children.client.delete("isolated_test", [str(child.id)])
-    else:
-        payload = child.model_dump(mode="json")
-        payload[{"parent_id": "parent_id", "id": "id", "hash": "document_hash"}[damage]] = str(
-            uuid4()
-        )
-        pipeline.children.client.overwrite_payload("isolated_test", payload, [str(child.id)])
-    assert not pipeline.ingest_document(source).skipped
-    assert pipeline.children.verify_children(chunks, all_revisions=True)
-    assert pipeline.ingest_document(source).skipped
-
-
-def test_same_count_wrong_point_id_is_repaired(pipeline, source):
-    pipeline.ingest_document(source)
-    child = pipeline.chunker.chunk(source).children[0]
-    client = pipeline.children.client
-    client.delete("isolated_test", [str(child.id)])
-    client.upsert(
-        "isolated_test",
-        [
-            models.PointStruct(
-                id=str(uuid4()), vector=[1.0] + [0.0] * 383, payload=child.model_dump(mode="json")
-            )
-        ],
+    config_hash = pipeline.sparse_encoder.config.fingerprint
+    assert pipeline.parents.verify_parents(chunks)
+    assert pipeline.children.verify_children(chunks, config_hash)
+    records = pipeline.children.client.retrieve(
+        "isolated_test", [str(child.id) for child in chunks.children], with_vectors=True
     )
-    assert client.count("isolated_test").count == 3
-    assert not pipeline.ingest_document(source).skipped
-    assert pipeline.ingest_document(source).skipped
+    assert all(set(record.vector) == {"", "bm25"} for record in records)
+    assert first.sparse_nonzero_terms > 0
+    assert all(record.payload["sparse_config_hash"] == config_hash for record in records)
 
 
 @pytest.mark.parametrize("change", ["source", "config", "title"])
-def test_updates_remove_children_before_parents_including_legacy_points(
+def test_document_updates_are_deferred_without_changing_stored_data(
     pipeline, source, make_document, change
 ):
     pipeline.ingest_document(source)
-    old_ids = set(pipeline.parents.parents)
-    # Simulate a legacy point lacking parent_id and revision hashes.
-    pipeline.children.client.upsert(
-        "isolated_test",
-        [
-            models.PointStruct(
-                id=str(uuid4()),
-                vector=[1.0] + [0.0] * 383,
-                payload={
-                    "document_id": source.metadata.document_id,
-                    "file_name": source.metadata.file_name,
-                    "text": "legacy",
-                },
-            )
-        ],
-    )
-    updated = source
+    before_parents = copy.deepcopy(pipeline.parents.parents)
+    before_states = copy.deepcopy(pipeline.parents.states)
+    before_children = pipeline.children.client.scroll("isolated_test", with_vectors=True)[0]
+    changed = source
     if change == "source":
-        updated = make_document("### Description\nNew alpha content.\n")
+        changed = make_document("### Description\nNew alpha content.\n")
     elif change == "title":
-        updated = make_document("### Description\nNew alpha content.\n", title="Updated Title")
+        changed = make_document("### Description\nNew alpha content.\n", title="Updated Title")
     else:
         pipeline.chunker = MarkdownChunker(
             pipeline.chunker.tokenizer, ChunkingConfig(child_overlap_tokens=30)
         )
-    finish = pipeline.parents.finish_revision
-
-    def assert_cleanup(chunks):
-        assert old_ids <= pipeline.parents.parents.keys()
-        assert pipeline.children.verify_children(chunks, all_revisions=True)
-        finish(chunks)
-
-    with patch.object(pipeline.parents, "finish_revision", side_effect=assert_cleanup):
-        pipeline.ingest_document(updated)
-    assert not old_ids & pipeline.parents.parents.keys()
-    assert len(pipeline.parents.states) == 1
-    assert pipeline.ingest_document(updated).skipped
+    with pytest.raises(ValueError, match="Phase 8"):
+        pipeline.ingest_document(changed)
+    assert pipeline.parents.parents == before_parents
+    assert pipeline.parents.states == before_states
+    assert pipeline.children.client.scroll("isolated_test", with_vectors=True)[0] == before_children
 
 
-@pytest.mark.parametrize(
-    "boundary", ["prepare", "embed", "upsert", "after_upsert", "cleanup", "after_cleanup", "finish"]
-)
-def test_partial_write_and_cleanup_failures_leave_processing_state_and_retry_safely(
-    pipeline, source, make_document, boundary
-):
-    pipeline.ingest_document(source)
-    old_ids = set(pipeline.parents.parents)
-    old_state = copy.deepcopy(pipeline.parents.states)
-    updated = make_document("### Description\nnew content.\n\n#### Detail\nmore content.\n")
-    chunks = pipeline.chunker.chunk(updated)
-    targets = {
-        "prepare": (pipeline.parents, "prepare_revision"),
+@pytest.mark.parametrize("boundary", ["embed", "sparse", "upsert", "after_upsert", "finish"])
+def test_initial_ingestion_failure_never_marks_partial_records_complete(pipeline, source, boundary):
+    target, method = {
         "embed": (pipeline.embedder, "embed"),
+        "sparse": (pipeline.sparse_encoder, "encode"),
         "upsert": (pipeline.children, "upsert"),
         "after_upsert": (pipeline.children, "upsert"),
-        "cleanup": (pipeline.children, "remove_obsolete"),
-        "after_cleanup": (pipeline.children, "remove_obsolete"),
         "finish": (pipeline.parents, "finish_revision"),
-    }
-    target, method = targets[boundary]
+    }[boundary]
     original = getattr(target, method)
 
     def fail(*args, **kwargs):
-        if boundary.startswith("after_"):
+        if boundary == "after_upsert":
             original(*args, **kwargs)
         raise RuntimeError("interrupted")
 
     with patch.object(target, method, side_effect=fail), pytest.raises(RuntimeError):
-        pipeline.ingest_document(updated)
-    assert old_ids <= pipeline.parents.parents.keys()
-    if boundary == "prepare":
-        assert pipeline.parents.states == old_state
-    else:
-        assert pipeline.parents.states[document_revision(chunks).key]["status"] == "processing"
-    assert not pipeline.ingest_document(updated).skipped
-    assert pipeline.ingest_document(updated).skipped
-    assert pipeline.children.verify_children(chunks, all_revisions=True)
-    assert pipeline.parents.verify_parents(chunks, all_revisions=True)
+        pipeline.ingest_document(source)
+    assert {state["status"] for state in pipeline.parents.states.values()} == {"processing"}
+    pipeline.ingest_document(source)
+    chunks = pipeline.chunker.chunk(source)
+    assert pipeline.children.verify_children(chunks, pipeline.sparse_encoder.config.fingerprint)
+    assert pipeline.parents.verify_parents(chunks)
 
 
 def test_invalid_persisted_reference_blocks_child_writes(pipeline, source, caplog):
@@ -271,14 +200,10 @@ def test_invalid_persisted_reference_blocks_child_writes(pipeline, source, caplo
     assert {s["status"] for s in pipeline.parents.states.values()} == {"processing"}
 
 
-def test_failed_stored_verification_never_removes_old_records(pipeline, source):
-    with (
-        patch.object(pipeline.children, "verify_children", return_value=False),
-        patch.object(pipeline.children, "remove_obsolete") as cleanup,
-    ):
+def test_failed_stored_verification_leaves_processing_state(pipeline, source):
+    with patch.object(pipeline.children, "verify_children", return_value=False):
         with pytest.raises(ValueError, match="verification failed"):
             pipeline.ingest_document(source)
-    cleanup.assert_not_called()
     assert {s["status"] for s in pipeline.parents.states.values()} == {"processing"}
 
 
@@ -293,12 +218,12 @@ def test_corpus_report_failures_do_not_prevent_other_documents_from_finishing(
     with pytest.raises(IngestionError) as exc:
         pipeline.ingest(settings)
     report = exc.value.report
-    assert (report.processed, report.failed, report.skipped) == (9, 1, 0)
+    assert (report.processed, report.failed) == (9, 1)
     assert report.failures == [{"file_name": DOCUMENT_FILES[0], "error": "FileNotFoundError"}]
     assert all(json.loads(line.message)["event"] == "document_failed" for line in caplog.records)
     (settings.data_dir / DOCUMENT_FILES[0]).write_bytes(markdown(DOCUMENT_FILES[0]))
     retry = pipeline.ingest(settings)
-    assert (retry.processed, retry.failed, retry.skipped) == (1, 0, 9)
+    assert (retry.processed, retry.failed) == (10, 0)
 
 
 def test_incompatible_collection_is_rejected():

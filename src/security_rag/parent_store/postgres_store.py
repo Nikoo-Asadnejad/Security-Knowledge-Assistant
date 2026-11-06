@@ -4,16 +4,22 @@ from pathlib import Path
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import Engine, Table, and_, create_engine, delete, func, or_, select, update
+from sqlalchemy import Engine, Table, and_, create_engine, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql.elements import ColumnElement
 
 from security_rag.config import Settings
+from security_rag.embeddings.bm25 import SparseConfig
 from security_rag.ingestion.chunk_models import ChunkedDocument, ParentChunk
 from security_rag.parent_store.migration_runner import MIGRATIONS, migrate
 from security_rag.parent_store.models import ParentReference, Revision, document_revision
-from security_rag.parent_store.schema import REVISION_COLUMNS, document_ingestions, parent_chunks
+from security_rag.parent_store.schema import (
+    REVISION_COLUMNS,
+    document_ingestions,
+    parent_chunks,
+    sparse_configuration,
+)
 
 
 def _revision_where(table: Table, revision: Revision) -> ColumnElement[bool]:
@@ -84,6 +90,8 @@ class PostgresStore:
             index_elements=list(REVISION_COLUMNS),
             set_={
                 "status": "processing",
+                "sparse_status": "processing",
+                "sparse_config_hash": None,
                 "expected_parents": state.excluded.expected_parents,
                 "expected_children": state.excluded.expected_children,
                 "updated_at": func.now(),
@@ -104,6 +112,22 @@ class PostgresStore:
             record["id"] = parent.id
             rows.append(record)
         with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(document_ingestions).where(
+                    or_(
+                        document_ingestions.c.document_id == revision.document_id,
+                        document_ingestions.c.document_id.in_(
+                            select(parent_chunks.c.document_id).where(
+                                parent_chunks.c.file_name == chunks.parents[0].file_name
+                            )
+                        ),
+                    )
+                )
+            ).mappings()
+            if any(
+                tuple(row[name] for name in REVISION_COLUMNS) != revision.key for row in existing
+            ):
+                raise ValueError("Document updates are deferred to Phase 8")
             connection.execute(state)
             connection.execute(parents, rows)
 
@@ -125,62 +149,50 @@ class PostgresStore:
             if ref.parent_id in parents and Revision.of(parents[ref.parent_id]).key == ref.key
         }
 
-    def verify_parents(
-        self, chunks: ChunkedDocument, *, all_revisions: bool = False, allow_extra: bool = False
-    ) -> bool:
-        revision = document_revision(chunks)
-        where = (
-            or_(
-                parent_chunks.c.document_id == revision.document_id,
-                parent_chunks.c.file_name == chunks.parents[0].file_name,
-            )
-            if all_revisions
-            else _revision_where(parent_chunks, revision)
-        )
-        expected = {parent.id: parent for parent in chunks.parents}
-        if allow_extra:
-            # Obsolete records are removed after child cleanup. Only validate expected IDs.
-            where = and_(where, parent_chunks.c.id.in_(expected))
+    def verify_parents(self, chunks: ChunkedDocument) -> bool:
         with self.engine.connect() as connection:
-            rows = connection.execute(select(parent_chunks).where(where)).mappings()
+            rows = connection.execute(
+                select(parent_chunks).where(
+                    _revision_where(parent_chunks, document_revision(chunks))
+                )
+            ).mappings()
             try:
                 actual = {row["id"]: ParentChunk.model_validate(row) for row in rows}
             except ValidationError:
                 return False
-        return actual == expected
+        return actual == {parent.id: parent for parent in chunks.parents}
 
-    def finish_revision(self, chunks: ChunkedDocument) -> None:
-        """Call only after Qdrant obsolete-child removal and verification succeed."""
-        revision = document_revision(chunks)
-        # The manifest filename remains stable even if a revised title changes its slug ID.
-        identity = or_(
-            parent_chunks.c.document_id == revision.document_id,
-            parent_chunks.c.file_name == chunks.parents[0].file_name,
-        )
+    def finish_revision(self, chunks: ChunkedDocument, sparse_config_hash: str) -> None:
+        """Complete only after parents and both child vectors have been verified."""
         with self.engine.begin() as connection:
-            document_ids = {revision.document_id} | set(
-                connection.execute(
-                    select(parent_chunks.c.document_id).where(identity).distinct()
-                ).scalars()
-            )
-            connection.execute(
-                delete(parent_chunks).where(
-                    identity, parent_chunks.c.id.not_in([parent.id for parent in chunks.parents])
-                )
-            )
-            connection.execute(
-                delete(document_ingestions).where(
-                    document_ingestions.c.document_id.in_(document_ids),
-                    ~_revision_where(document_ingestions, revision),
-                )
-            )
             result = connection.execute(
                 update(document_ingestions)
-                .where(_revision_where(document_ingestions, revision))
-                .values(status="completed", updated_at=func.now())
+                .where(_revision_where(document_ingestions, document_revision(chunks)))
+                .values(
+                    status="completed",
+                    sparse_status="completed",
+                    sparse_config_hash=sparse_config_hash,
+                    updated_at=func.now(),
+                )
             )
             if result.rowcount != 1:
                 raise ValueError("Cannot complete a revision without ingestion state")
+
+    def sparse_config(self) -> SparseConfig | None:
+        with self.engine.connect() as connection:
+            value = connection.scalar(select(sparse_configuration.c.config))
+            return SparseConfig.model_validate(value) if value is not None else None
+
+    def save_sparse_config(self, config: SparseConfig) -> None:
+        with self.engine.begin() as connection:
+            current = connection.scalar(select(sparse_configuration.c.config))
+            if current is not None:
+                if SparseConfig.model_validate(current) != config:
+                    raise ValueError("Sparse configuration updates are deferred to Phase 8")
+                return
+            connection.execute(
+                insert(sparse_configuration).values(id=1, config=config.model_dump(mode="json"))
+            )
 
     def statistics(self) -> list[dict]:
         statement = select(document_ingestions).order_by(

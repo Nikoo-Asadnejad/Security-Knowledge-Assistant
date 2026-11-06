@@ -9,6 +9,8 @@ The application answers questions about LLM vulnerabilities, security risks, att
 **Primary goal:** Learn RAG engineering through practical implementation of document ingestion, Markdown-aware parent–child chunking, dense and BM25 sparse embeddings, PostgreSQL parent storage, Qdrant child indexing, hybrid retrieval, grounded generation, and evaluation.
 
 Keep the project small, modular, maintainable, and suitable for running locally.
+The current ingestion scope is initial indexing with both vectors. Document updates,
+replacement, and incremental processing belong to Phase 8, with design discussed first.
 
 ## 2. Technology Stack
 
@@ -229,8 +231,8 @@ At query time, fetch only the parents referenced by the final reranked children,
 - Provide versioned Alembic Python schema migrations and an explicit CLI command to apply them; do not initialize or migrate the schema during API startup. Adopt the original SQL-migrated schema only after validating its recorded checksum, preserving existing parent data.
 - Store the complete parent record from Section 4 in `parent_chunks`, with `id` as a UUID primary key. Include original text, heading and source metadata, Markdown rendering fields, and revision hashes so context can be rendered without rereading source files.
 - Index `(document_id, document_hash, chunking_config_hash)` for revision checks and cleanup. Use the primary key for batched parent lookups.
-- Store ingestion state in `document_ingestions`, keyed by document ID and revision hashes. Record processing/completed status and expected parent/child counts so incomplete revisions cannot be skipped as unchanged.
-- Parent IDs are immutable revision-specific identifiers. Changed source or configuration produces new rows; unchanged records can be upserted idempotently.
+- Store ingestion state in `document_ingestions`, keyed by document ID and revision hashes. Record processing/completed status and expected parent/child counts so partially written documents are not marked complete.
+- Parent IDs are immutable revision-specific identifiers. The chunker derives IDs from source/configuration hashes; operational handling of changed input is deferred to Phase 8. Repeated identical input upserts the same IDs.
 - Qdrant's `parent_id` is an application-enforced reference to PostgreSQL; a database foreign key cannot enforce it across the two stores.
 
 ### Qdrant child storage
@@ -247,9 +249,11 @@ Vector dimensions: 384.
 
 Store only searchable children as vector points. Store parent records in PostgreSQL as described above; do not embed parents or duplicate parent text in Qdrant.
 
-Phase 3 uses an unnamed dense vector with cosine distance. Phase 4 adds a named `bm25` sparse vector to every child point in the same collection, with `SparseVectorParams(modifier=Modifier.IDF)`. Sparse vectors contain term indices and weights; they do not have a fixed 384-dimensional shape or use cosine normalization. Keep the existing dense vector unnamed to avoid an unnecessary dense-vector migration. Sparse and dense vectors share the child's point ID and payload.
+Initial ingestion creates each child point with an unnamed dense vector using cosine distance and a named `bm25` sparse vector in the same collection, with `SparseVectorParams(modifier=Modifier.IDF)`. Sparse vectors contain term indices and weights; they do not have a fixed 384-dimensional shape or use cosine normalization. Keep the existing dense vector unnamed to avoid an unnecessary dense-vector migration. Sparse and dense vectors share the child's point ID and payload.
 
-Use the pinned Qdrant 1.19.2 server's add-vector-name operation to extend the existing collection, then update only the sparse vector during backfill. Verify this against the real server; do not silently recreate the collection or replace existing dense vectors. New ingestion writes both representations. See [Qdrant collection vector schema updates](https://qdrant.tech/documentation/manage-data/collections/#update-vector-schema).
+Create the collection with both vector spaces defined from the start. Every child
+write requires both vectors. Existing compatible collections can be used for repeated
+identical input; there is no dense-only migration, sparse-only repair, or backfill path.
 
 ### Qdrant child point payload
 
@@ -286,23 +290,20 @@ From Phase 4, also store `sparse_config_hash` and an `identifiers` keyword array
 
 Use the deterministic parent and child UUID rules from Section 4. The Qdrant point ID must equal the payload's child `id`. `chunk_index` is document-wide; `child_index` is relative to the parent. Do not use random IDs for repeated ingestion.
 
-### Idempotent ingestion
+### Initial ingestion
 
-- Detect whether the document has already been indexed using PostgreSQL ingestion state.
-- Compare both `document_hash` and `chunking_config_hash` with the completed ingestion state.
-- Skip documents only when source and configuration are unchanged and the expected parent records in PostgreSQL and child records in Qdrant are complete, with matching IDs and revisions. Counts alone do not establish reference integrity.
-- Reprocess changed documents or chunking configurations, including migration from chunks without `parent_id`.
-- Validate the per-document parent/child output, then commit the new revision's parents and processing state to PostgreSQL before upserting child points into Qdrant.
-- Validate child references against persisted parents with matching document/configuration revisions. Upsert children in bounded batches using deterministic IDs.
-- After all new child upserts succeed and stored records are verified, remove obsolete child points from Qdrant. Only after their removal succeeds, delete obsolete parent revisions from PostgreSQL and mark the new revision complete in a transaction. Never delete parents while stored children still reference them.
-- Avoid duplicate vectors and stale chunks.
-- PostgreSQL and Qdrant do not share a transaction. Preserve incomplete processing state on failure and make every step retryable, including cleanup; never mark a partially indexed document complete. Parent writes that succeeded before a Qdrant failure can be reused on retry.
-- Never resolve children to parents from a different source/configuration revision.
-- From Phase 4, skipping also requires the expected sparse configuration and valid dense and sparse vectors for every child. Track sparse completion/configuration in PostgreSQL ingestion state through a new versioned migration. A Phase 3 `completed` record alone does not prove sparse readiness. Keep sparse configuration separate from `chunking_config_hash` so a sparse-only change does not regenerate parent/child IDs or dense embeddings. Interrupted backfills remain incomplete and retryable.
+- Validate per-document chunks, then commit parents and processing state to PostgreSQL before child writes.
+- Resolve child references against persisted parents with matching document/configuration hashes.
+- Generate dense and BM25 sparse vectors for every bounded child batch and upsert them together on the same point IDs.
+- Do not check existing sparse vectors to select a repair path or skip encoding. Repeated identical input regenerates both representations and upserts deterministic IDs.
+- Verify stored parent records, child payloads, vector validity, and expected IDs before marking ingestion complete.
+- Keep incomplete processing state if encoding, persistence, or verification fails. A repeated initial run writes both vectors again.
+- Reject changed documents or chunking/sparse configuration instead of mixing revisions or deleting existing data. Document updates and cleanup require the separate Phase 8 design.
+- Never resolve children to a different parent revision. PostgreSQL and Qdrant do not share a transaction.
+- Retain the already-applied schema migrations and persisted sparse configuration. Their historical schema does not require keeping the removed backfill runtime.
 
-For the local MVP, run ingestion while the API is stopped and resume serving only after ingestion completes successfully. Concurrent reindexing and atomic publication across both stores are out of scope.
-
-Keep the Qdrant collection name configurable, but use only one collection for this project.
+Run ingestion while the API is stopped. Concurrent ingestion and serving are outside
+the local MVP scope. Keep the collection name configurable and use one collection.
 
 ## 6. Dense and Sparse Embedding Pipeline
 
@@ -316,8 +317,8 @@ The ingestion pipeline:
 4. Calculate hashes, deterministic IDs, parent links, and source metadata.
 5. Prepare and validate child embedding inputs with contextual headings.
 6. Validate parent references and persist parents plus processing state in PostgreSQL.
-7. Generate child dense embeddings in bounded batches; from Phase 4, also generate BM25 sparse vectors for those same children. Do not embed parents.
-8. Upsert child points into Qdrant, verify both required vector representations, persisted parent references, and payloads, then complete revision cleanup and PostgreSQL ingestion state as specified in Section 5.
+7. Generate dense and BM25 sparse vectors for the same child batch. Do not embed parents.
+8. Upsert child points into Qdrant, verify both required vector representations, persisted parent references, and payloads, then complete PostgreSQL ingestion state as specified in Section 5.
 9. Log ingestion statistics and release per-document chunk records before processing the next document.
 
 The cross-encoder is loaded and used at retrieval time, not during ingestion.
@@ -328,10 +329,9 @@ Track:
 - Number of parents and children created
 - Child token lengths and invalid parent-reference failures
 - Embedding duration
-- Sparse encoding duration, nonzero term counts, and sparse backfill/completion status from Phase 4
+- Sparse encoding duration, nonzero term counts, configuration identity, and document completion status
 - Parent persistence duration
 - Indexing duration
-- Documents skipped as unchanged
 - Failed documents
 
 Embedding should be performed offline through the ingestion CLI, not during FastAPI startup.
@@ -347,9 +347,9 @@ Apply these project defaults and checks:
 - Test actual emitted tokens for `LLM01`, `CWE-79`, `CVE-2026-12345`, `ERR_CONNECTION_RESET`, and `0x80070005`. These are tokenizer fixtures, not claims that every code occurs in OWASP. Preserve digits, and explicitly configure and test the token-length limit so long identifiers are not silently discarded.
 - For recognized punctuated codes, add one deterministic alphanumeric alias before BM25 encoding on both documents and queries so the complete code can contribute a single term. Preserve the canonical original identifier in `identifiers`; aliases and hashed terms can collide and are not an exact-match guarantee. Keep extraction rules bounded to the supported code patterns rather than building a general code parser.
 - BM25 is ranked term matching, not substring, phrase, or Boolean equality search. Create keyword payload indexes for `document_id` and `identifiers`. When a caller explicitly requires an exact identifier, use an exact payload filter on both retrieval branches. Do not hard-filter ordinary questions merely because they mention a code; they may seek related guidance. No separate full-text engine is required.
-- Start with BM25 `k=1.2` and `b=0.75`. Measure average lexical child length using the selected analyzer before the initial backfill and freeze it as `avg_len`. FastEmbed's default `256` is a constant, not an automatically computed corpus average. Keep the frozen value for incremental ingestion; changing it requires re-encoding all sparse vectors. Qdrant updates IDF as points change, so corpus updates alone do not require rebuilding all vectors for IDF.
+- Start with BM25 `k=1.2` and `b=0.75`. Measure average lexical child length using the selected analyzer before initial indexing and freeze it as `avg_len`. FastEmbed's default `256` is a constant, not an automatically computed corpus average. Reuse the frozen value for repeated initial ingestion. Changes to that configuration are deferred to Phase 8. Qdrant updates IDF as points change, so corpus updates alone do not require rebuilding all vectors for IDF.
 - Hash the sparse model/library version, preprocessing and identifier rules, language/stemming/stopword settings, token limit, lexical-input format, BM25 parameters, and frozen `avg_len` into `sparse_config_hash`. Validate equal index/value lengths, unique nonnegative term indices, finite positive weights, and expected nonempty vectors before writes. Treat a child with no lexical terms as an explicit ingestion failure to resolve, rather than marking it ready.
-- Reuse one sparse encoder per process, process bounded batches, and backfill every existing child with the API stopped. Verify vector presence, configuration, payloads, and parent references before marking sparse indexing complete. Support retries and repair of missing or stale sparse vectors without re-embedding unchanged dense content.
+- Reuse one sparse encoder per process and process bounded batches with the API stopped. Generate both vectors for every child write, then verify stored vector validity, payloads, and parent references before marking the document complete. Keep update and repair policies for Phase 8.
 
 Qdrant's current guidance recommends payload full-text BM25 scoring when available; that feature requires v1.20.0, beyond this project's pinned v1.19.2. The selected sparse-vector route meets the requirement to store a sparse vector on every point and fits the existing local FastEmbed setup. A text payload filter alone on this version does not provide ranked BM25. See [Qdrant text indexing and BM25 version requirements](https://qdrant.tech/documentation/manage-data/indexing/#bm25-scoring) and [sparse-vector BM25 guidance](https://qdrant.tech/documentation/search/text-search/sparse-vector-search/).
 
@@ -375,7 +375,7 @@ The two branches can produce up to 40 unique children before fusion. RRF selects
 
 The cross-encoder score is the final retrieval rank signal; do not blend it with dense, BM25, or RRF scores. A cross-encoder is query-dependent and cannot be precomputed during ingestion, so load it once per process and reuse it across requests. If reranking fails, log the failure and return up to three fused candidates only when the API contract explicitly marks the response as degraded with null reranker scores; otherwise return service unavailable. Test that reranking does not discard relevant exact-code hits; neither fusion nor reranking guarantees they remain in the final three.
 
-Reject empty questions. A valid question with no lexical terms or no sparse matches may use dense retrieval with an explicit `dense_only` retrieval mode. An encoder/store failure or an incomplete sparse backfill is an error, not an empty lexical match; return service unavailable rather than silently downgrading hybrid retrieval.
+Reject empty questions. A valid question with no lexical terms or no sparse matches may use dense retrieval with an explicit `dense_only` retrieval mode. An encoder/store failure or incomplete initial ingestion is an error, not an empty lexical match; return service unavailable rather than silently downgrading hybrid retrieval.
 
 For `/ask`, fetch the parents referenced by the final reranked children from PostgreSQL and use them as generation context:
 
@@ -562,7 +562,7 @@ Measure:
 - Dense and sparse encoding/search latency, fusion latency, reranking latency, and end-to-end retrieval latency
 - Embedding duration
 - Indexing duration
-- Sparse vector coverage, nonzero counts, backfill duration, and sparse configuration identity
+- Sparse vector coverage, nonzero counts, encoding duration, and sparse configuration identity
 
 Record results as JSON or CSV.
 
@@ -591,10 +591,11 @@ ai-security-rag/
 │       │   ├── downloader.py
 │       │   ├── loader.py
 │       │   ├── chunker.py
+│       │   ├── sparse_config.py
 │       │   └── pipeline.py
 │       ├── embeddings/
 │       │   ├── embedder.py
-│       │   └── sparse_embedder.py
+│       │   └── bm25.py
 │       ├── vector_store/
 │       │   └── qdrant_store.py
 │       ├── parent_store/
@@ -669,22 +670,26 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Create the Qdrant collection.
 - Store child vectors, text, parent IDs, and source/revision metadata in Qdrant.
 - Implement deterministic point IDs.
-- Implement incremental, idempotent ingestion with persisted parent-reference validation, recovery from partial writes across both stores, obsolete-child cleanup before obsolete-parent deletion, and completion tracking.
+- Implement initial ingestion with persisted parent-reference validation, deterministic writes, and completion tracking. Defer incremental changes and obsolete-record cleanup to Phase 8.
 - Verify PostgreSQL parent records, Qdrant payloads, and persistence across application restarts.
 
-**Acceptance:** All ten OWASP documents have parents persisted in PostgreSQL and searchable children indexed in Qdrant without duplicates or dangling parent references. Stored child points contain parent IDs, titles, filenames, hashes, and source links. Matching parents can be fetched in a batch after an application restart without source reconstruction or loading all parents into memory. Unchanged complete revisions are skipped safely, and retries recover from partial PostgreSQL/Qdrant writes and cleanup failures.
+**Acceptance:** All ten OWASP documents have parents persisted in PostgreSQL and searchable children indexed in Qdrant without duplicates or dangling parent references. Stored child points contain parent IDs, titles, filenames, hashes, and source links. Matching parents can be fetched in a batch after an application restart without source reconstruction or loading all parents into memory. Repeated identical input regenerates both vectors using the same IDs. Changed-input processing is deferred to Phase 8; initial failures never mark partial writes complete.
 
-### Phase 4 — BM25 sparse vectors and existing-point backfill
+### Phase 4 — Initial dense and BM25 sparse indexing
 
-- Implement the local BM25 encoder and shared lexical preprocessing described in Section 6; test identifier tokens and canonical exact-match metadata.
-- Measure and freeze lexical average child length, version the sparse configuration, and extend PostgreSQL ingestion state through a new migration without changing chunk IDs or parent revisions.
-- Add the named `bm25` sparse vector with Qdrant IDF to the existing single collection, preserving unnamed dense vectors, point IDs, payloads, and parent references.
-- Provide an explicit offline CLI operation to backfill/repair sparse vectors on all existing children in bounded batches. Add sparse generation to subsequent ingestion.
-- Validate dense/sparse vector content and sparse configuration before skipping or completing a document. Recover from interrupted backfills and repair missing/stale sparse representations without regenerating intact dense vectors.
-- Add keyword payload indexes for `document_id` and `identifiers`; preserve original code values for explicit exact filtering.
-- Test real-server schema extension and backfill, retry/idempotency, configuration changes, vector coverage, and preservation of dense vectors and parent links. Leave hybrid query orchestration to Phase 5.
+- Implement local BM25 encoding and shared lexical preprocessing; test technical identifiers and canonical metadata.
+- Measure and freeze the average lexical child length and persist the versioned sparse configuration.
+- Create the Qdrant collection with both unnamed dense and named `bm25` vector spaces and Qdrant IDF.
+- Generate both vectors explicitly in the ingestion pipeline and write them together for every child batch.
+- Require dense and sparse inputs at the vector-store boundary; do not retain optional dense-only writes, sparse-existence branches, or backfill commands.
+- Add keyword indexes for `document_id` and `identifiers`.
+- Validate stored records after writing, preserve parent links, and verify initial ingestion and deterministic repeated runs against the real stores.
+- Retain existing applied migrations and stored data. Defer source/configuration updates and obsolete-parent/child cleanup to Phase 8.
 
-**Acceptance:** Every searchable child point has its original dense vector plus a valid `bm25` sparse vector and the expected sparse configuration. Backfill is bounded, retryable, and safe for existing IDs and parent references. Repeated ingestion skips only fully verified dual-vector records. Tokenizer fixtures distinguish supported codes from near matches through canonical identifier metadata, and sparse readiness survives restart.
+**Acceptance:** An initial run stores both vectors for every child, with matching
+parent records in PostgreSQL. Repeated identical input executes the same complete
+encoding path without duplicate IDs. No sparse-only backfill or repair is required.
+Hybrid orchestration remains Phase 5.
 
 ### Phase 5 — Hybrid retrieval and Search API
 
@@ -720,6 +725,20 @@ Avoid unnecessary layers, patterns, and abstractions.
 
 **Acceptance:** The system can be evaluated reproducibly and run locally following the README.
 
+### Phase 8 — Document updates and lifecycle (design discussion required)
+
+**Status: planned; discuss the update flow before implementation.**
+
+Scope: updating an existing source document must coordinate its PostgreSQL parents,
+Qdrant child chunks, and both dense and sparse vectors. Discuss changed/removed
+sections, revision identity, stale records, and consistency across both stores.
+Also decide how chunking or embedding-configuration changes should be handled.
+
+Do not select an update algorithm, deletion order, incremental skip policy, repair
+mechanism, publication strategy, or retry/backfill workflow in this phase description.
+Those choices and the detailed acceptance criteria will be agreed during the design
+conversation. The initial-ingestion path currently rejects changed input.
+
 ## 13. Testing and Code Quality
 
 - Use Python type hints.
@@ -734,10 +753,10 @@ Avoid unnecessary layers, patterns, and abstractions.
 - Verify parent lookup after restarting the application without local source reconstruction or loading the complete parent corpus.
 - Test repeated headings, code-fence heading lookalikes, source ranges, and complete embedding-input token limits.
 - Test hashing and deterministic identifiers.
-- Test repeated ingestion and document updates.
-- Test chunking-configuration changes, failed parent transactions, interrupted child upserts, retries, cleanup failures, obsolete-child removal before obsolete-parent deletion, and completion only after both stores are consistent.
+- Test that repeated identical input encodes both vectors without duplicate IDs, and changed input is rejected until Phase 8.
+- Test failed parent transactions, interrupted initial child writes, and completion only after both stores are consistent. Update/cleanup tests will follow the Phase 8 design.
 - Test Qdrant retrieval using an isolated test collection.
-- Test adding sparse schema to the pinned real Qdrant server without recreating the dense collection, preserving dense vectors/IDs/payloads during sparse-only updates, complete sparse coverage, restart behavior, interrupted backfill recovery, and sparse configuration invalidation.
+- Test fresh collection creation with both vector spaces, complete dual-vector coverage, parent references, restart persistence, and rejection of unsupported sparse configuration changes.
 - Test document/query lexical preprocessing parity, stable term indices, identifier aliases and exact payload matching, case/punctuation/digit handling, long tokens, nonempty child vectors, invalid indices/weights, and empty lexical questions.
 - Test filtered dense/sparse prefetch limits, RRF deduplication and fused limits, sparse-only relevant hits, unavailable branch diagnostics, and explicit branch-error handling.
 - Use an isolated PostgreSQL test database/schema for integration tests; keep unit tests independent of running databases.
@@ -773,10 +792,10 @@ The project is complete when:
 1. Ten OWASP Markdown files can be downloaded directly from GitHub.
 2. Files are saved under `data/owasp/`.
 3. Combined Markdown-aware parent–child chunking works with the selected configuration and produces bounded per-document parents and children.
-4. Local dense embeddings and BM25 sparse vectors are generated successfully for every searchable child, including existing-point backfill.
+4. Initial ingestion generates and stores dense and BM25 sparse vectors together for every searchable child.
 5. PostgreSQL durably stores parents and ingestion state; one Qdrant collection stores both child vector representations with versioned sparse configuration and IDF enabled. Parents can be fetched by ID after restart without rebuilding them from local sources or retaining the corpus in memory.
 6. Every child point contains a valid parent ID, document ID, title, filename, source metadata, and hashes.
-7. Ingestion is idempotent across PostgreSQL and Qdrant, with safe cleanup ordering and recovery from partial failures.
+7. Repeated identical ingestion writes both vectors on deterministic IDs without duplicates; partial writes are never marked complete. Changed-document replacement and cleanup belong to the separately discussed Phase 8.
 8. `/search` prefetches up to 20 dense and 20 BM25 child hits, fuses to up to 20 unique candidates with RRF, reranks them with the cross-encoder, and returns the relevant Top-3 children with correctly labeled scores, retrieval mode, and parent IDs. Code/keyword and semantic retrieval are validated separately.
 9. `/ask` deduplicates parent IDs, batch-fetches matching parents from PostgreSQL in retrieval rank order, and generates grounded answers with traceable citations within the generation model's context budget. Missing or mismatched parents use child-text fallback; database outages are reported explicitly.
 10. Retrieval evaluation and tests run successfully.

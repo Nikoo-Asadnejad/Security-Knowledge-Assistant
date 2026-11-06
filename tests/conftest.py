@@ -50,3 +50,14 @@ def make_document():
         return parse_document(Path("LLM01_PromptInjection.md"), text.encode())
 
     return make
+
+
+@pytest.fixture
+def sparse_encoder(tmp_path, monkeypatch):
+    # Exercise the actual FastEmbed analyzer/weighting without downloading unused stopword files.
+    from fastembed.sparse.bm25 import Bm25
+
+    from security_rag.embeddings.bm25 import BM25Encoder, SparseConfig
+
+    monkeypatch.setattr(Bm25, "download_model", lambda *args, **kwargs: tmp_path)
+    return BM25Encoder(SparseConfig(avg_len=10), tmp_path)
