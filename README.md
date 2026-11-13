@@ -11,7 +11,7 @@ Built with Python 3.12+, uv, and FastAPI.
 Phases 1–4 are implemented: document downloading, Markdown-aware parent–child
 chunking, persistent PostgreSQL parents and ingestion state, local CPU embeddings,
 and initial Qdrant child indexing with both dense and BM25 sparse vectors.
-Phase 5 will implement hybrid retrieval and `/search`. Document updates are deferred
+Phase 5 implements hybrid retrieval and `/search`. Document updates are deferred
 to Phase 8; its flow will be discussed before implementation.
 Answer generation (Phase 6) and evaluation (Phase 7) are also planned.
 
@@ -61,7 +61,7 @@ writes precede Qdrant child writes, and incomplete ingestion remains retryable.
 
 ### Retrieval and answers
 
-Phase 5 will implement hybrid retrieval and `/search`; Phase 6 will add parent
+Phase 5 implements hybrid retrieval and `/search`. Phase 6 will add parent
 expansion and `/ask`. The cross-encoder reranks the fused candidates before either
 response path.
 
@@ -166,7 +166,9 @@ uv run security-rag stats
 ```
 
 `ingest` is an explicit offline command; starting containers does not ingest data.
-Keep the API stopped until ingestion finishes. The initial pipeline is:
+Run ingestion offline. PostgreSQL grants one writer lock per database for the
+whole command. A second ingestion exits with an error, and search returns 503
+while the writer holds the lock. The initial pipeline is:
 
 1. Load and validate each local Markdown document.
 2. Build bounded parents and children with deterministic IDs and revision hashes.
@@ -178,7 +180,10 @@ Keep the API stopped until ingestion finishes. The initial pipeline is:
 
 Dense encoding uses CPU FastEmbed `BAAI/bge-small-en-v1.5`, initialized only when
 needed and reused within the process. Its output has 384 dimensions; complete child
-inputs are checked against the matching tokenizer without silent truncation.
+inputs are checked against the matching tokenizer without silent truncation. Chunking and dense
+embedding share `CHILD_MAX_TOKENS` (default 450, maximum 512). Keep the same
+budget for an already indexed corpus, since changing it changes the chunking
+fingerprint and requires the Phase 8 update flow.
 
 BM25 encoding uses local FastEmbed `Qdrant/bm25`, with Qdrant applying IDF once.
 The first ingestion measures average analyzed child length and freezes it in
@@ -227,22 +232,37 @@ without loading models. The application’s `resolve_parents()` uses one batched
 parent-store lookup and excludes missing or mismatched revisions. Phase 6 will use this to
 build answer context without loading the parent corpus into memory.
 
-## Planned retrieval pipeline
+## Search API
 
-Phase 5 will encode the question for dense semantic search and BM25 lexical search,
-prefetch up to 20 children from each branch, and fuse their rankings with reciprocal
+After all documents have been ingested, start the API and query it:
+
+```sh
+uv run uvicorn security_rag.api:app --host 127.0.0.1 --port 8000
+curl -fsS http://127.0.0.1:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"How can I reduce the risks of prompt injection?","identifier":"LLM01"}'
+```
+
+`POST /search` accepts `query` and optional `document_id` and `identifier` filters.
+The CPU reranker defaults to `Xenova/ms-marco-MiniLM-L-6-v2` and uses the
+embedding cache. Models load on first use.
+
+The API encodes the question for dense semantic search and BM25 lexical search,
+prefetches up to 20 children from each branch, and fuses their rankings with reciprocal
 rank fusion (RRF). The union can contain up to 40 children; fusion will retain at most
-20 for cross-encoder reranking, and `/search` will return the top three children.
+20 for cross-encoder reranking, and `/search` returns up to three children.
 Apply the same optional document or explicit exact-identifier filter to both branches
 before their candidate limits. [Qdrant's Query API supports prefetch and RRF fusion](https://qdrant.tech/documentation/search/hybrid-queries/).
 
 Dense retrieval covers semantic paraphrases; BM25 supplies lexical evidence for
 specific keywords and codes present in the indexed content or metadata. RRF combines
-ranks because dense and BM25 scores have different scales. Responses will distinguish
-fusion scores from reranker scores; raw branch scores/ranks will be nullable unless
-collected. Empty lexical matches can use an explicit `dense_only` mode; encoder/store
-failures and incomplete sparse indexing will return an error. A reranker fallback
-must be explicitly marked as degraded.
+ranks because dense and BM25 scores have different scales. Responses distinguish
+fusion scores from reranker scores. Branch scores and ranks are null when they
+were not collected. Queries with no lexical terms use
+`dense_only`. A nonempty sparse query uses RRF even if the sparse prefetch
+finds no hits. Encoder or store failures and incomplete indexing return 503.
+Reranker failure returns the first three candidates in retrieval order with
+`degraded: true` and null reranker scores.
 
 In Phase 6, `/ask` will deduplicate those children's parent IDs and fetch the matching
 parents from PostgreSQL in one parameterized batch query. It will preserve the rank
@@ -372,6 +392,9 @@ Run PostgreSQL integration tests against the local development database:
 TEST_DATABASE_URL='<local PostgreSQL URL>' uv run pytest -q tests/test_postgres_store.py
 # Optional: include checks against a live Qdrant instance.
 TEST_QDRANT_URL=http://localhost:6333 uv run pytest -q tests/test_qdrant_live.py
+# Verify the retry path against both live stores before merging storage changes.
+TEST_DATABASE_URL='<local PostgreSQL URL>' TEST_QDRANT_URL=http://localhost:6333 \
+  uv run pytest -q 'tests/test_postgres_store.py::test_ingestion_recovers_from_partial_child_upserts[live]'
 ```
 
 PostgreSQL tests create and remove a unique disposable schema for each case, leaving
@@ -380,9 +403,11 @@ adoption, pool limits and statement timeouts, parent round trips, Markdown field
 batched lookup from a fresh pool, ingestion-state persistence, and recovery after
 partial initial child writes. Qdrant tests create and remove an isolated test
 collection. Both integrations are opt-in; default unit tests require no services.
-Set both `TEST_DATABASE_URL` and `TEST_QDRANT_URL` to include the dual-store sparse
-acceptance test. It verifies initial dual-vector creation, sparse queries with exact identifier
-filters, parent lookup after restart, and completion only after verification. BM25 unit tests exercise the actual FastEmbed analyzer and weights
+Set both `TEST_DATABASE_URL` and `TEST_QDRANT_URL` to include the live dual-store tests.
+They verify initial dual-vector creation, exact identifier filters, and recovery after
+an interrupted child upsert. The retry test checks that parents are committed before
+the first child write and that completion follows verification of both stores.
+BM25 unit tests exercise the actual FastEmbed analyzer and weights
 without downloading its unused stopword artifacts.
 
 ## OWASP attribution
@@ -403,7 +428,7 @@ adapted OWASP material.
 - [x] Phase 2: Markdown-aware parent–child chunking and tokenizer validation.
 - [x] Phase 3: PostgreSQL parent storage, local embeddings, and initial Qdrant child ingestion.
 - [x] Phase 4: Dense and BM25 sparse vectors written together during initial ingestion.
-- [ ] Phase 5: Dense + BM25 hybrid retrieval, RRF, reranking, and Top-3 search API.
+- [x] Phase 5: Dense + BM25 hybrid retrieval, RRF, reranking, and Top-3 search API.
 - [ ] Phase 6: Grounded answers and source citations.
 - [ ] Phase 7: Evaluation dataset, metrics, tests, and documentation.
 - [ ] Phase 8: Document updates for PostgreSQL parents and Qdrant children; design discussion first.

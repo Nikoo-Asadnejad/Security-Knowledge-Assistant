@@ -76,3 +76,34 @@ class SparseEncoder(Protocol):
     def config(self) -> SparseConfig: ...
 
     def encode(self, texts: list[str]) -> list[SparseVector]: ...
+
+
+@dataclass(frozen=True)
+class SearchFilters:
+    document_id: str | None = None
+    identifier: str | None = None
+
+
+@dataclass(frozen=True)
+class Candidate:
+    child: ChildChunk
+    score: float
+
+
+class QueryEncoder(Protocol):
+    def encode_query(self, query: str) -> tuple[list[float], SparseVector]: ...
+
+
+class CandidateIndex(Protocol):
+    def candidates(
+        self,
+        dense: list[float],
+        sparse: SparseVector | None,
+        filters: SearchFilters,
+        *,
+        limit: int,
+    ) -> list[Candidate]: ...
+
+
+class Reranker(Protocol):
+    def score(self, query: str, texts: list[str]) -> list[float]: ...

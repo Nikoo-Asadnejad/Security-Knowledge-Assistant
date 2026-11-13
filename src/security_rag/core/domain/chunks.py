@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from security_rag.core.domain.documents import DocumentMetadata
 
+DEFAULT_CHILD_MAX_TOKENS = 450
+EMBEDDING_MAX_TOKENS = 512
+
 ALGORITHM_VERSION = "markdown-parent-child-v2"
 HEADING_RULES = "atx-1-6-relative-to-title-fence-aware-source-occurrences"
 DOCUMENT_PREFIX = "Document: {title}\n"
@@ -24,7 +27,7 @@ class ChunkingConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     parent_max_tokens: int = Field(default=1200, gt=0)
-    child_max_tokens: int = Field(default=450, gt=0, le=512)
+    child_max_tokens: int = Field(default=DEFAULT_CHILD_MAX_TOKENS, gt=0, le=EMBEDDING_MAX_TOKENS)
     child_overlap_tokens: int = Field(default=60, ge=0, le=60)
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 

@@ -318,45 +318,110 @@ def test_document_updates_are_rejected_before_parent_or_state_changes(
     assert store.get_parents([p.id for p in new.parents]) == {}
 
 
-def test_real_postgres_and_qdrant_pipeline_recovers_from_partial_child_upserts(
-    postgres_store, tokenizer, make_document, sparse_encoder
+@pytest.mark.parametrize("qdrant_mode", ["local", "live"])
+def test_ingestion_recovers_from_partial_child_upserts(
+    postgres_store, tokenizer, make_document, sparse_encoder, qdrant_mode
 ):
     from qdrant_client import QdrantClient
 
     from security_rag.core.application.ingest import IngestionPipeline
-    from security_rag.infrastructure.persistence.qdrant import QdrantStore
+    from security_rag.infrastructure.persistence.qdrant import (
+        QdrantStore,
+        dense_vector,
+        sparse_vector,
+    )
 
+    url = os.environ.get("TEST_QDRANT_URL")
+    if qdrant_mode == "live" and not url:
+        pytest.skip("Set TEST_QDRANT_URL for the live dual-store retry test")
+    client_options = (
+        {"url": url, "timeout": 10} if qdrant_mode == "live" else {"location": ":memory:"}
+    )
     store = postgres_store
     store.migrate()
-    document = make_document("### Test\nalpha.\n\n### Other\nbeta.\n")
+    assert store.save_sparse_config(sparse_encoder.config) == sparse_encoder.config
+    document = make_document("### Test\nCWE-79 alpha.\n\n### Other\nbeta.\n")
     chunker = MarkdownChunker(tokenizer)
     chunks = chunker.chunk(document)
+    revision = document_revision(chunks)
+    config_hash = sparse_encoder.config.fingerprint
+    collection = f"test_retry_{uuid4().hex}"
 
     class LocalEmbedder:
         def embed(self, children):
             return [[1.0] + [0.0] * 383 for _ in children]
 
-    with closing(QdrantClient(":memory:")) as client:
-        children = QdrantStore(client, "postgres_integration", 1)
+    with closing(QdrantClient(**client_options)) as client:
+        children = QdrantStore(client, collection, 1)
         children.ensure_collection()
-        pipeline = IngestionPipeline(
-            chunker, store, children, LocalEmbedder(), sparse_encoder, batch_size=1
-        )
-        upsert = children.upsert
+        try:
+            pipeline = IngestionPipeline(
+                chunker, store, children, LocalEmbedder(), sparse_encoder, batch_size=1
+            )
+            upsert = children.upsert
 
-        def interrupt(*args):
-            upsert(*args)
-            raise RuntimeError("interrupted after successful child write")
+            def interrupt(*args):
+                # Read through a separate connection before the first child write.
+                state = store.ingestion_state(revision)
+                assert state["status"] == state["sparse_status"] == "processing"
+                assert store.verify_parents(chunks)
+                upsert(*args)
+                raise RuntimeError("interrupted after successful child write")
 
-        with patch.object(children, "upsert", side_effect=interrupt), pytest.raises(RuntimeError):
-            pipeline.ingest_document(document)
-        assert store.ingestion_state(document_revision(chunks))["status"] == "processing"
-        assert store.verify_parents(chunks)
-        assert client.count("postgres_integration").count == 1
-        pipeline.ingest_document(document)
-        assert children.verify_children(
-            document_revision(chunks), index_entries(chunks), sparse_encoder.config.fingerprint
-        )
+            with (
+                patch.object(children, "upsert", side_effect=interrupt),
+                pytest.raises(RuntimeError, match="interrupted after successful child write"),
+            ):
+                pipeline.ingest_document(document)
+            state = store.ingestion_state(revision)
+            assert state["status"] == state["sparse_status"] == "processing"
+            assert state["sparse_config_hash"] is None
+            records = [
+                record
+                for batch in children.records(revision.model_dump(), vectors=True)
+                for record in batch
+            ]
+            (first,) = records
+            assert first.id == str(chunks.children[0].id)
+            assert dense_vector(first) is not None
+            assert sparse_vector(first) is not None
+
+            store.close()
+            restarted = PostgresStore(store.engine)
+            children = QdrantStore(client, collection, 1)
+            retry = IngestionPipeline(
+                chunker, restarted, children, LocalEmbedder(), sparse_encoder, batch_size=1
+            )
+
+            finish = restarted.finish_revision
+            with (
+                patch.object(
+                    restarted, "verify_parents", wraps=restarted.verify_parents
+                ) as verify_parents,
+                patch.object(
+                    children, "verify_children", wraps=children.verify_children
+                ) as verify_children,
+            ):
+
+                def finish_after_verification(*args):
+                    assert verify_parents.call_count == 2
+                    verify_children.assert_called_once()
+                    state = restarted.ingestion_state(revision)
+                    assert state["status"] == state["sparse_status"] == "processing"
+                    return finish(*args)
+
+                with patch.object(
+                    restarted, "finish_revision", side_effect=finish_after_verification
+                ):
+                    report = retry.ingest_document(document)
+            state = restarted.ingestion_state(revision)
+            assert state["status"] == state["sparse_status"] == "completed"
+            assert state["sparse_config_hash"] == report.sparse_config_hash == config_hash
+            assert children.verify_children(revision, index_entries(chunks), config_hash)
+            assert client.count(collection, exact=True).count == len(chunks.children)
+            assert client.retrieve(collection, ids=[first.id], with_vectors=True) == [first]
+        finally:
+            client.delete_collection(collection)
 
 
 def test_failed_completion_keeps_processing_state_until_verified_retry(
@@ -379,3 +444,24 @@ def test_failed_completion_keeps_processing_state_until_verified_retry(
         connection.execute(DropConstraint(constraint))
     store.finish_revision(chunks, "a" * 64)
     assert store.ingestion_state(document_revision(chunks))["status"] == "completed"
+
+
+def test_ingestion_lock_excludes_other_writers_and_search_until_release(postgres_store):
+    from security_rag.core.application.ingest import IngestionBusy
+
+    store = postgres_store
+    store.migrate()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with store.single_writer():
+            assert store.statistics() == []
+            with pytest.raises(IngestionBusy), store.single_writer():
+                pytest.fail("Concurrent writer acquired the ingestion lock")
+            with pytest.raises(IngestionBusy), store.search_snapshot():
+                pytest.fail("Search acquired a snapshot while ingestion was active")
+            raise RuntimeError("interrupted")
+    with store.search_snapshot() as snapshot:
+        assert snapshot == (None, [])
+        with pytest.raises(IngestionBusy), store.single_writer():
+            pytest.fail("Writer acquired the ingestion lock during search")
+    with store.single_writer():
+        assert store.statistics() == []

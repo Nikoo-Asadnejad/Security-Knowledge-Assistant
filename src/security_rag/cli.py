@@ -13,7 +13,7 @@ from security_rag.bootstrap import (
     storage_statistics,
 )
 from security_rag.config import Settings
-from security_rag.core.application.ingest import IngestionError
+from security_rag.core.application.ingest import IngestionBusy, IngestionError
 from security_rag.infrastructure.download import DownloadError
 
 
@@ -50,6 +50,8 @@ def main() -> None:
         else:
             report = download_documents(settings, refresh=args.refresh)
             print(report.model_dump_json(indent=2))
+    except IngestionBusy as exc:
+        parser.exit(1, f"Ingest failed: {exc}\n")
     except (DownloadError, OSError, ValueError) as exc:
         label = {"chunk": "Chunking", "download": "Download"}.get(
             args.command, args.command.title()

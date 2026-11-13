@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from functools import partial
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from security_rag.config import Settings
 from security_rag.core.application.ingest import IngestionPipeline, IngestionReport
 from security_rag.core.application.preview import preview_chunks
 from security_rag.core.application.sparse_config import configure_sparse
+from security_rag.core.domain.chunks import ChunkingConfig
 from security_rag.core.domain.documents import Document
 from security_rag.core.domain.manifest import DOCUMENT_FILES
 from security_rag.infrastructure.download import download_documents as download_documents
 from security_rag.infrastructure.files import load_document, load_documents
 
 if TYPE_CHECKING:
+    from security_rag.core.application.ports import SearchFilters
+    from security_rag.core.application.search import SearchResult
+    from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
     from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
 
@@ -49,14 +55,21 @@ def chunk_documents(settings: Settings) -> dict:
     return preview_chunks(documents, _chunker(settings))
 
 
-def _chunker(settings: Settings) -> MarkdownChunker:
+def _tokenizer(settings: Settings) -> ChunkTokenizer:
     from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
-    from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
-    tokenizer = ChunkTokenizer.load(
+    return ChunkTokenizer.load(
         settings.embedding_model, path=settings.tokenizer_path, revision=settings.tokenizer_revision
     )
-    return MarkdownChunker(tokenizer)
+
+
+def _chunker(settings: Settings) -> MarkdownChunker:
+    from security_rag.infrastructure.markdown_chunker import MarkdownChunker
+
+    config = ChunkingConfig(
+        child_max_tokens=settings.child_max_tokens, embedding_model=settings.embedding_model
+    )
+    return MarkdownChunker(_tokenizer(settings), config)
 
 
 def ingest_documents(settings: Settings) -> IngestionReport:
@@ -76,6 +89,7 @@ def ingest_documents(settings: Settings) -> IngestionReport:
             raise ValueError(f"Missing document {name}; run download first")
 
     chunker = _chunker(settings)
+    dense = Embedder(settings, chunker.tokenizer)
 
     def load(name: str) -> Document:
         return load_document(settings.data_dir / name)
@@ -83,7 +97,10 @@ def ingest_documents(settings: Settings) -> IngestionReport:
     lexical_children = (
         child for name in DOCUMENT_FILES for child in chunker.chunk(load(name)).children
     )
-    with closing(PostgresStore.from_settings(settings)) as parents:
+    with (
+        closing(PostgresStore.from_settings(settings)) as parents,
+        parents.single_writer(),
+    ):
         sparse = configure_sparse(
             parents,
             lexical_children,
@@ -101,7 +118,52 @@ def ingest_documents(settings: Settings) -> IngestionReport:
                 chunker,
                 parents,
                 QdrantStore(client, settings.qdrant_collection, settings.ingestion_batch_size),
-                Embedder(settings, chunker.tokenizer),
+                dense,
                 sparse,
                 batch_size=settings.ingestion_batch_size,
             ).ingest(DOCUMENT_FILES, load)
+
+
+@contextmanager
+def search_runtime(settings: Settings) -> Iterator[Callable[[str, SearchFilters], SearchResult]]:
+    from qdrant_client import QdrantClient
+
+    from security_rag.core.application.search import Search, SearchUnavailable, completed_corpus
+    from security_rag.infrastructure.embeddings.fastembed.bm25 import config_for_average
+    from security_rag.infrastructure.embeddings.fastembed.embedder import Embedder
+    from security_rag.infrastructure.embeddings.fastembed.reranker import CrossEncoder
+    from security_rag.infrastructure.embeddings.fastembed.search_encoder import SearchEncoder
+    from security_rag.infrastructure.persistence.postgres.postgres_store import PostgresStore
+    from security_rag.infrastructure.persistence.qdrant import QdrantStore
+
+    with (
+        closing(PostgresStore.from_settings(settings, check_connection=False)) as parents,
+        closing(QdrantClient(url=str(settings.qdrant_url), timeout=30)) as client,
+    ):
+        store = QdrantStore(client, settings.qdrant_collection)
+        reranker = CrossEncoder(settings)
+        encoder = None
+        chunking_hash = None
+        model_lock = Lock()
+
+        def run(query: str, filters: SearchFilters) -> SearchResult:
+            nonlocal encoder, chunking_hash
+            with parents.search_snapshot() as (config, states):
+                if config is None or config != config_for_average(
+                    config.avg_len,
+                    k=settings.bm25_k,
+                    b=settings.bm25_b,
+                    token_max_length=settings.bm25_token_max_length,
+                ):
+                    raise SearchUnavailable("Sparse configuration is missing or incompatible")
+                with model_lock:
+                    if encoder is None:
+                        chunker = _chunker(settings)
+                        encoder = SearchEncoder(Embedder(settings, chunker.tokenizer), settings)
+                        chunking_hash = chunker.config_hash
+                config_hash = config.fingerprint
+                revisions, count = completed_corpus(states, config_hash, chunking_hash)
+                index = store.search_index(revisions, config_hash, count)
+                return Search(encoder.for_config(config), index, reranker).run(query, filters)
+
+        yield run

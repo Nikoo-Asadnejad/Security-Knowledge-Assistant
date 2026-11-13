@@ -56,7 +56,7 @@ def test_invalid_embedding_output_is_rejected(vectors, expected):
 
 
 def test_unsupported_model_and_oversized_batch_rejected(settings, tokenizer, make_document):
-    with pytest.raises(ValueError, match="supports only"):
+    with pytest.raises(ValueError, match="Only"):
         Embedder(settings.model_copy(update={"embedding_model": "other"}), tokenizer)
     children = MarkdownChunker(tokenizer).chunk(make_document("### Test\nalpha.\n")).children
     embedder = Embedder(settings.model_copy(update={"ingestion_batch_size": 1}), tokenizer)
@@ -65,3 +65,17 @@ def test_unsupported_model_and_oversized_batch_rejected(settings, tokenizer, mak
     long_child = children[0].model_copy(update={"text": "alpha " * 500})
     with pytest.raises(ValueError, match="450 tokens"):
         embedder.embed((long_child,))
+
+
+def test_nondefault_child_budget_matches_chunker(settings, tokenizer, make_document):
+    from security_rag.core.domain.chunks import ChunkingConfig
+
+    settings.child_max_tokens = 480
+    chunker = MarkdownChunker(tokenizer, ChunkingConfig(child_max_tokens=settings.child_max_tokens))
+    children = chunker.chunk(make_document("### Test\n" + "alpha " * 451)).children
+    assert 450 < chunker.child_token_count(children[0]) <= 480
+    model = MagicMock()
+    model.model.tokenizer = tokenizer._tokenizer
+    model.embed.return_value = [np.ones(384)]
+    with patch("fastembed.TextEmbedding", return_value=model):
+        assert len(Embedder(settings, tokenizer).embed(children)) == 1

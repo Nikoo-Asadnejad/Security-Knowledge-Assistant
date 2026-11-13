@@ -1,16 +1,18 @@
 """Durable parent records using SQLAlchemy Core and explicit transactions."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import Engine, Table, and_, create_engine, func, or_, select, update
+from sqlalchemy import Connection, Engine, Table, and_, create_engine, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql.elements import ColumnElement
 
 from security_rag.config import Settings
+from security_rag.core.application.ingest import IngestionBusy
 from security_rag.core.domain.chunks import ChunkedDocument, ParentChunk
 from security_rag.core.domain.revisions import Revision, document_revision
 from security_rag.core.domain.sparse_config import SparseConfig
@@ -21,6 +23,8 @@ from security_rag.infrastructure.persistence.postgres.schema import (
     parent_chunks,
     sparse_configuration,
 )
+
+INGESTION_LOCK = 726403102
 
 
 def _revision_where(table: Table, revision: Revision) -> ColumnElement[bool]:
@@ -37,7 +41,7 @@ class PostgresStore:
         self.engine = engine
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "PostgresStore":
+    def from_settings(cls, settings: Settings, *, check_connection: bool = True) -> "PostgresStore":
         url = settings.database_url.get_secret_value()
         if not url:
             raise ValueError("Set DATABASE_URL before using PostgreSQL")
@@ -57,12 +61,13 @@ class PostgresStore:
                 "options": f"-c statement_timeout={timeout_ms}",
             },
         )
-        try:
-            with engine.connect() as connection:
-                connection.execute(select(1))
-        except Exception:
-            engine.dispose()
-            raise
+        if check_connection:
+            try:
+                with engine.connect() as connection:
+                    connection.execute(select(1))
+            except Exception:
+                engine.dispose()
+                raise
         return cls(engine)
 
     def close(self) -> None:
@@ -70,6 +75,28 @@ class PostgresStore:
 
     def migrate(self, directory: Path = MIGRATIONS) -> list[str]:
         return migrate(self.engine, directory)
+
+    @contextmanager
+    def single_writer(self) -> Iterator[None]:
+        # Detach this dedicated session so a pool of size one can still run writes.
+        # Closing the physical session releases its advisory lock, including on failure.
+        with self.engine.connect() as session:
+            session.detach()
+            acquired = session.scalar(select(func.pg_try_advisory_lock(INGESTION_LOCK)))
+            session.commit()
+            if not acquired:
+                raise IngestionBusy("Another ingestion or search is already running")
+            yield
+
+    @contextmanager
+    def search_snapshot(self) -> Iterator[tuple[SparseConfig | None, list[dict]]]:
+        with self.engine.begin() as connection:
+            acquired = connection.scalar(
+                select(func.pg_try_advisory_xact_lock_shared(INGESTION_LOCK))
+            )
+            if not acquired:
+                raise IngestionBusy("An ingestion is already running")
+            yield self._sparse_config(connection), self._statistics(connection)
 
     def ingestion_state(self, revision: Revision) -> dict | None:
         statement = select(document_ingestions).where(
@@ -171,8 +198,12 @@ class PostgresStore:
 
     def sparse_config(self) -> SparseConfig | None:
         with self.engine.connect() as connection:
-            value = connection.scalar(select(sparse_configuration.c.config))
-            return SparseConfig.model_validate(value) if value is not None else None
+            return self._sparse_config(connection)
+
+    @staticmethod
+    def _sparse_config(connection: Connection) -> SparseConfig | None:
+        value = connection.scalar(select(sparse_configuration.c.config))
+        return SparseConfig.model_validate(value) if value is not None else None
 
     def save_sparse_config(self, config: SparseConfig) -> SparseConfig:
         with self.engine.begin() as connection:
@@ -185,8 +216,12 @@ class PostgresStore:
             return SparseConfig.model_validate(value)
 
     def statistics(self) -> list[dict]:
+        with self.engine.connect() as connection:
+            return self._statistics(connection)
+
+    @staticmethod
+    def _statistics(connection: Connection) -> list[dict]:
         statement = select(document_ingestions).order_by(
             document_ingestions.c.document_id, document_ingestions.c.updated_at
         )
-        with self.engine.connect() as connection:
-            return [dict(row) for row in connection.execute(statement).mappings()]
+        return [dict(row) for row in connection.execute(statement).mappings()]

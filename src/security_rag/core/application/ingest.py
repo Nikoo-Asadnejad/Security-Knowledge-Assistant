@@ -25,6 +25,10 @@ from security_rag.core.domain.revisions import ParentReference, Revision, docume
 logger = logging.getLogger(__name__)
 
 
+class IngestionBusy(RuntimeError):
+    """An ingestion run already holds the writer lock."""
+
+
 class IngestionError(RuntimeError):
     """The report preserves completed documents and identifies retryable failures."""
 

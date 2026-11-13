@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import closing, nullcontext
 
 import pytest
 from qdrant_client import QdrantClient
@@ -27,6 +27,7 @@ def test_fresh_ingest_creates_both_vectors_and_repeat_regenerates_both(
         )
     parents = MemoryParents()
     monkeypatch.setattr(parents, "close", lambda: None, raising=False)
+    monkeypatch.setattr(parents, "single_writer", nullcontext, raising=False)
     dense = FakeEmbedder(parents, settings.ingestion_batch_size)
     directory = tmp_path / "qdrant"
     monkeypatch.setattr(
