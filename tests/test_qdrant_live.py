@@ -6,9 +6,12 @@ from uuid import uuid4
 
 import pytest
 from qdrant_client import QdrantClient
+from test_ingestion import index_entries
 
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.vector_store.qdrant_store import QdrantStore
+from security_rag.core.domain.lexical import lexical_text
+from security_rag.core.domain.revisions import document_revision
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
+from security_rag.infrastructure.persistence.qdrant import QdrantStore
 
 
 def test_live_dense_and_sparse_vector_round_trip(tokenizer, make_document, sparse_encoder):
@@ -22,20 +25,21 @@ def test_live_dense_and_sparse_vector_round_trip(tokenizer, make_document, spars
         try:
             chunker = MarkdownChunker(tokenizer)
             chunks = chunker.chunk(make_document("### Description\nalpha.\n\n### Detail\nbeta.\n"))
-            for child in chunks.children:
-                from security_rag.embeddings.bm25 import lexical_text
-
+            entries = index_entries(chunks)
+            for entry in entries:
                 store.upsert(
-                    (child,),
+                    (entry,),
                     [[1.0] + [0.0] * 383],
-                    sparse_encoder.encode([lexical_text(child)]),
+                    sparse_encoder.encode([lexical_text(entry.child)]),
                     sparse_encoder.config.fingerprint,
                 )
             hits = client.query_points(name, query=[1.0] + [0.0] * 383, limit=3).points
             assert len(hits) == 2
             assert all(hit.id == hit.payload["id"] for hit in hits)
             assert all(hit.payload["parent_id"] for hit in hits)
-            assert store.verify_children(chunks, sparse_encoder.config.fingerprint)
+            assert store.verify_children(
+                document_revision(chunks), entries, sparse_encoder.config.fingerprint
+            )
             assert store.statistics()["children"] == 2
         finally:
             client.delete_collection(name)

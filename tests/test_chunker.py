@@ -5,9 +5,9 @@ import pytest
 from pydantic import ValidationError
 from tokenizers import models
 
-from security_rag.ingestion.chunk_models import ChunkedDocument, ChunkingConfig, sha256
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.chunks import ChunkedDocument, ChunkingConfig, sha256
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
 MODEL = "BAAI/bge-small-en-v1.5"
 

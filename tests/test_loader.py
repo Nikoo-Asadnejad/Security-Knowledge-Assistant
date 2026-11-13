@@ -2,8 +2,9 @@ import hashlib
 
 import pytest
 
-from security_rag.ingestion.loader import load_document, load_documents, parse_document
-from security_rag.ingestion.manifest import DOCUMENT_FILES, SOURCE_BASE_URL
+from security_rag.core.domain.documents import parse_document
+from security_rag.core.domain.manifest import DOCUMENT_FILES, SOURCE_BASE_URL
+from security_rag.infrastructure.files import load_document, load_documents
 
 
 def test_metadata_and_hash_preserve_original_bytes(tmp_path):

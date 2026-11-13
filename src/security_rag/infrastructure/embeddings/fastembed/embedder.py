@@ -1,25 +1,11 @@
 """CPU FastEmbed adapter; model initialization happens only on the first write."""
 
-import math
-
 from security_rag.config import Settings
-from security_rag.ingestion.chunk_models import ChildChunk
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.chunks import ChildChunk
+from security_rag.core.domain.vectors import validate_vectors
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
 
-VECTOR_SIZE = 384
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
-
-
-def validate_vectors(vectors: list[list[float]], expected: int) -> None:
-    if len(vectors) != expected:
-        raise ValueError("Embedding count does not match child count")
-    if any(
-        len(vector) != VECTOR_SIZE
-        or not all(math.isfinite(value) for value in vector)
-        or not any(vector)
-        for vector in vectors
-    ):
-        raise ValueError("Expected finite, nonzero 384-dimensional embeddings")
 
 
 class Embedder:

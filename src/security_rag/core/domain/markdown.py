@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 
-from security_rag.ingestion.loader import Document
+from security_rag.core.domain.documents import Document
 
 HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)")

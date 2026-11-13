@@ -4,8 +4,8 @@ import pytest
 from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
 
 from security_rag.config import Settings
-from security_rag.ingestion.loader import parse_document
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.documents import parse_document
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
 
 
 @pytest.fixture
@@ -57,7 +57,11 @@ def sparse_encoder(tmp_path, monkeypatch):
     # Exercise the actual FastEmbed analyzer/weighting without downloading unused stopword files.
     from fastembed.sparse.bm25 import Bm25
 
-    from security_rag.embeddings.bm25 import BM25Encoder, SparseConfig
+    from security_rag.infrastructure.embeddings.fastembed.bm25 import (
+        BM25Encoder,
+        config_for_average,
+    )
 
     monkeypatch.setattr(Bm25, "download_model", lambda *args, **kwargs: tmp_path)
-    return BM25Encoder(SparseConfig(avg_len=10), tmp_path)
+    config = config_for_average(avg_len=10, k=1.2, b=0.75, token_max_length=512)
+    return BM25Encoder(config, tmp_path)

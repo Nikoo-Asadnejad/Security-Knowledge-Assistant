@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from security_rag.cli import main
-from security_rag.ingestion.downloader import DownloadError, DownloadReport
+from security_rag.infrastructure.download import DownloadError, DownloadReport
 
 
 @pytest.mark.parametrize(
@@ -70,7 +70,7 @@ def test_invalid_configuration_exits_without_traceback(settings, monkeypatch, ca
 def test_chunk_command_prints_statistics_and_parent_child_texts_without_writing_files(
     settings, monkeypatch, capsys, markdown, tokenizer, tmp_path
 ):
-    from security_rag.ingestion.manifest import DOCUMENT_FILES
+    from security_rag.core.domain.manifest import DOCUMENT_FILES
 
     settings.data_dir.mkdir()
     body = (
@@ -81,7 +81,10 @@ def test_chunk_command_prints_statistics_and_parent_child_texts_without_writing_
     monkeypatch.setenv("DATA_DIR", str(settings.data_dir))
     monkeypatch.setattr(sys, "argv", ["security-rag", "chunk"])
     existing_files = set(tmp_path.rglob("*"))
-    with patch("security_rag.ingestion.tokenizer.ChunkTokenizer.load", return_value=tokenizer):
+    with patch(
+        "security_rag.infrastructure.embeddings.fastembed.tokenizer.ChunkTokenizer.load",
+        return_value=tokenizer,
+    ):
         main()
     report = json.loads(capsys.readouterr().out)
     assert len(report["documents"]) == 10
@@ -110,7 +113,9 @@ def test_chunk_command_prints_statistics_and_parent_child_texts_without_writing_
 def test_missing_documents_fail_before_tokenizer_download(settings, monkeypatch, capsys):
     monkeypatch.setenv("DATA_DIR", str(settings.data_dir))
     monkeypatch.setattr(sys, "argv", ["security-rag", "chunk"])
-    with patch("security_rag.ingestion.tokenizer.ChunkTokenizer.load") as load:
+    with patch(
+        "security_rag.infrastructure.embeddings.fastembed.tokenizer.ChunkTokenizer.load"
+    ) as load:
         with pytest.raises(SystemExit) as exc:
             main()
     assert exc.value.code == 1
@@ -121,7 +126,7 @@ def test_missing_documents_fail_before_tokenizer_download(settings, monkeypatch,
 def test_invalid_tokenizer_exits_without_traceback(
     settings, monkeypatch, capsys, markdown, tmp_path
 ):
-    from security_rag.ingestion.manifest import DOCUMENT_FILES
+    from security_rag.core.domain.manifest import DOCUMENT_FILES
 
     settings.data_dir.mkdir()
     for name in DOCUMENT_FILES:
@@ -137,21 +142,32 @@ def test_invalid_tokenizer_exits_without_traceback(
     assert "Chunking failed: Could not load tokenizer" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["migrate", "ingest", "stats"])
-def test_storage_commands_print_json(settings, monkeypatch, capsys, command):
+@pytest.mark.parametrize(
+    "command,handler",
+    [
+        ("migrate", "migrate_database"),
+        ("ingest", "ingest_documents"),
+        ("stats", "storage_statistics"),
+    ],
+)
+def test_storage_commands_print_json(settings, monkeypatch, capsys, command, handler):
+    from security_rag.core.application.ingest import IngestionReport
+
     monkeypatch.setattr(sys, "argv", ["security-rag", command])
-    with patch("security_rag.cli.storage_command", return_value={"ok": True}) as run:
+    result = IngestionReport() if command == "ingest" else {"ok": True}
+    with patch(f"security_rag.cli.{handler}", return_value=result) as run:
         main()
-    assert run.call_args.args[0] == command
-    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    run.assert_called_once()
+    expected = result.model_dump() if command == "ingest" else result
+    assert json.loads(capsys.readouterr().out) == expected
 
 
 def test_ingestion_failure_prints_report_and_nonzero_status(settings, monkeypatch, capsys):
-    from security_rag.ingestion.pipeline import IngestionError, IngestionReport
+    from security_rag.core.application.ingest import IngestionError, IngestionReport
 
     monkeypatch.setattr(sys, "argv", ["security-rag", "ingest"])
     report = IngestionReport(failed=1, failures=[{"file_name": "bad.md", "error": "ValueError"}])
-    with patch("security_rag.cli.storage_command", side_effect=IngestionError(report)):
+    with patch("security_rag.cli.ingest_documents", side_effect=IngestionError(report)):
         with pytest.raises(SystemExit) as exc:
             main()
     assert exc.value.code == 1
@@ -162,7 +178,7 @@ def test_ingestion_failure_prints_report_and_nonzero_status(settings, monkeypatc
 
 def test_database_error_does_not_disclose_credentials(settings, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["security-rag", "migrate"])
-    with patch("security_rag.cli.storage_command", side_effect=RuntimeError("secret-password")):
+    with patch("security_rag.cli.migrate_database", side_effect=RuntimeError("secret-password")):
         with pytest.raises(SystemExit):
             main()
     assert "secret-password" not in capsys.readouterr().err

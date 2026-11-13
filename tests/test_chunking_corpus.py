@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.ingestion.loader import load_document
-from security_rag.ingestion.manifest import DOCUMENT_FILES
-from security_rag.ingestion.markdown import MarkdownStructure
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.manifest import DOCUMENT_FILES
+from security_rag.core.domain.markdown import MarkdownStructure
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
+from security_rag.infrastructure.files import load_document
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
 
 @pytest.fixture(scope="module")

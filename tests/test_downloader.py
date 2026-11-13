@@ -4,9 +4,9 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from security_rag.ingestion.downloader import DownloadError, download_documents
-from security_rag.ingestion.loader import load_documents
-from security_rag.ingestion.manifest import DOCUMENT_FILES, RAW_BASE_URL
+from security_rag.core.domain.manifest import DOCUMENT_FILES, RAW_BASE_URL
+from security_rag.infrastructure.download import DownloadError, download_documents
+from security_rag.infrastructure.files import load_documents
 
 
 def test_download_skip_and_refresh(settings, markdown):
@@ -73,7 +73,7 @@ def test_transient_errors_are_retried(settings, markdown, failure):
 
     with (
         httpx.Client(transport=httpx.MockTransport(handle)) as client,
-        patch("security_rag.ingestion.downloader.time.sleep") as sleep,
+        patch("security_rag.infrastructure.download.time.sleep") as sleep,
     ):
         assert download_documents(settings, client=client).downloaded == 10
     assert calls == 12
@@ -136,7 +136,7 @@ def test_exhausted_retries_leave_no_partial_files(settings):
     transport = httpx.MockTransport(lambda request: httpx.Response(503))
     with (
         httpx.Client(transport=transport) as client,
-        patch("security_rag.ingestion.downloader.time.sleep") as sleep,
+        patch("security_rag.infrastructure.download.time.sleep") as sleep,
         pytest.raises(DownloadError),
     ):
         download_documents(settings, client=client)

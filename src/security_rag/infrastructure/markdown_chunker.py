@@ -6,7 +6,7 @@ from uuid import UUID, uuid5
 from langchain_core.documents import Document as SplitDocument
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from security_rag.ingestion.chunk_models import (
+from security_rag.core.domain.chunks import (
     ChildChunk,
     ChunkedDocument,
     ChunkingConfig,
@@ -14,9 +14,9 @@ from security_rag.ingestion.chunk_models import (
     render_context,
     sha256,
 )
-from security_rag.ingestion.loader import Document
-from security_rag.ingestion.markdown import MarkdownStructure
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.documents import Document
+from security_rag.core.domain.markdown import MarkdownStructure
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
 
 CHUNK_NAMESPACE = UUID("639da67d-5fa9-552b-8170-40c950509bdc")
 
@@ -32,6 +32,16 @@ class MarkdownChunker:
         if self.config.embedding_model != tokenizer.model_name:
             raise ValueError("Chunking configuration and tokenizer model must match")
         self.config_hash = self.config.fingerprint(tokenizer.fingerprint)
+
+    @property
+    def child_max_tokens(self) -> int:
+        return self.config.child_max_tokens
+
+    def parent_token_count(self, parent: ParentChunk) -> int:
+        return self.tokenizer.count(parent.context_text)
+
+    def child_token_count(self, child: ChildChunk) -> int:
+        return self.tokenizer.count(child.embedding_text)
 
     def chunk(self, document: Document) -> ChunkedDocument:
         structure = MarkdownStructure(document)

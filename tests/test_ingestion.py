@@ -6,11 +6,20 @@ from unittest.mock import patch
 import pytest
 from qdrant_client import QdrantClient, models
 
-from security_rag.ingestion.chunk_models import ChunkingConfig
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.ingestion.pipeline import IngestionError, IngestionPipeline
-from security_rag.parent_store.models import Revision, document_revision
-from security_rag.vector_store.qdrant_store import QdrantStore
+from security_rag.core.application.ingest import IngestionError, IngestionPipeline
+from security_rag.core.application.ports import ChildIndexEntry
+from security_rag.core.domain.chunks import ChunkingConfig
+from security_rag.core.domain.lexical import identifiers, lexical_text
+from security_rag.core.domain.revisions import Revision, document_revision
+from security_rag.infrastructure.files import load_document
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
+from security_rag.infrastructure.persistence.qdrant import QdrantStore
+
+
+def index_entries(chunks):
+    return tuple(
+        ChildIndexEntry(child, tuple(identifiers(lexical_text(child)))) for child in chunks.children
+    )
 
 
 class MemoryParents:
@@ -25,15 +34,24 @@ class MemoryParents:
     def ingestion_state(self, revision):
         return self.states.get(revision.key)
 
-    def prepare_revision(self, chunks):
+    def prepare_revision(self, chunks, *, check_existing):
         revision = document_revision(chunks)
         existing_ids = {revision.document_id} | {
             p.document_id
             for p in self.parents.values()
             if p.file_name == chunks.parents[0].file_name
         }
-        if any(key[0] in existing_ids and key != revision.key for key in self.states):
-            raise ValueError("Document updates are deferred to Phase 8")
+        check_existing(
+            tuple(
+                Revision(
+                    document_id=document_id,
+                    document_hash=source_hash,
+                    chunking_config_hash=config_hash,
+                )
+                for document_id, source_hash, config_hash in self.states
+                if document_id in existing_ids
+            )
+        )
         self.events.append("prepare")
         self.states[revision.key] = {
             "status": "processing",
@@ -49,12 +67,9 @@ class MemoryParents:
         }
         return actual == {p.id: p for p in chunks.parents}
 
-    def resolve_parents(self, references):
+    def get_parents(self, ids):
         return {
-            ref.parent_id: self.parents[ref.parent_id]
-            for ref in references
-            if ref.parent_id in self.parents
-            and Revision.of(self.parents[ref.parent_id]).key == ref.key
+            parent_id: self.parents[parent_id] for parent_id in ids if parent_id in self.parents
         }
 
     def finish_revision(self, chunks, sparse_config_hash):
@@ -67,9 +82,9 @@ class MemoryParents:
         return self.config
 
     def save_sparse_config(self, config):
-        if self.config is not None and self.config != config:
-            raise ValueError("Sparse configuration updates are deferred to Phase 8")
-        self.config = config
+        if self.config is None:
+            self.config = config
+        return self.config
 
     def statistics(self):
         return [
@@ -132,7 +147,9 @@ def test_ingestion_writes_both_vectors_on_every_run_without_duplicates(pipeline,
     chunks = pipeline.chunker.chunk(source)
     config_hash = pipeline.sparse_encoder.config.fingerprint
     assert pipeline.parents.verify_parents(chunks)
-    assert pipeline.children.verify_children(chunks, config_hash)
+    assert pipeline.children.verify_children(
+        document_revision(chunks), index_entries(chunks), config_hash
+    )
     records = pipeline.children.client.retrieve(
         "isolated_test", [str(child.id) for child in chunks.children], with_vectors=True
     )
@@ -186,12 +203,14 @@ def test_initial_ingestion_failure_never_marks_partial_records_complete(pipeline
     assert {state["status"] for state in pipeline.parents.states.values()} == {"processing"}
     pipeline.ingest_document(source)
     chunks = pipeline.chunker.chunk(source)
-    assert pipeline.children.verify_children(chunks, pipeline.sparse_encoder.config.fingerprint)
+    assert pipeline.children.verify_children(
+        document_revision(chunks), index_entries(chunks), pipeline.sparse_encoder.config.fingerprint
+    )
     assert pipeline.parents.verify_parents(chunks)
 
 
 def test_invalid_persisted_reference_blocks_child_writes(pipeline, source, caplog):
-    with patch.object(pipeline.parents, "resolve_parents", return_value={}):
+    with patch.object(pipeline.parents, "get_parents", return_value={}):
         with pytest.raises(ValueError, match="invalid persisted parent"):
             pipeline.ingest_document(source)
     assert pipeline.embedder.calls == 0
@@ -210,19 +229,23 @@ def test_failed_stored_verification_leaves_processing_state(pipeline, source):
 def test_corpus_report_failures_do_not_prevent_other_documents_from_finishing(
     pipeline, settings, markdown, caplog
 ):
-    from security_rag.ingestion.manifest import DOCUMENT_FILES
+    from security_rag.core.domain.manifest import DOCUMENT_FILES
 
     settings.data_dir.mkdir()
     for name in DOCUMENT_FILES[1:]:
         (settings.data_dir / name).write_bytes(markdown(name))
+
+    def load(name):
+        return load_document(settings.data_dir / name)
+
     with pytest.raises(IngestionError) as exc:
-        pipeline.ingest(settings)
+        pipeline.ingest(DOCUMENT_FILES, load)
     report = exc.value.report
     assert (report.processed, report.failed) == (9, 1)
     assert report.failures == [{"file_name": DOCUMENT_FILES[0], "error": "FileNotFoundError"}]
     assert all(json.loads(line.message)["event"] == "document_failed" for line in caplog.records)
     (settings.data_dir / DOCUMENT_FILES[0]).write_bytes(markdown(DOCUMENT_FILES[0]))
-    retry = pipeline.ingest(settings)
+    retry = pipeline.ingest(DOCUMENT_FILES, load)
     assert (retry.processed, retry.failed) == (10, 0)
 
 

@@ -4,9 +4,9 @@ import pytest
 from qdrant_client import QdrantClient
 from test_ingestion import FakeEmbedder, MemoryParents
 
-from security_rag.ingestion.pipeline import ingest_documents
-from security_rag.ingestion.sparse_config import configure_sparse
-from security_rag.vector_store.qdrant_store import QdrantStore, dense_vector
+from security_rag.bootstrap import ingest_documents
+from security_rag.core.application.sparse_config import configure_sparse
+from security_rag.infrastructure.persistence.qdrant import QdrantStore, dense_vector, sparse_vector
 
 
 def snapshot(store):
@@ -16,9 +16,8 @@ def snapshot(store):
 def test_fresh_ingest_creates_both_vectors_and_repeat_regenerates_both(
     settings, markdown, tokenizer, sparse_encoder, monkeypatch, tmp_path
 ):
-    from security_rag.embeddings.bm25 import validate_sparse
-    from security_rag.embeddings.embedder import validate_vectors
-    from security_rag.ingestion.manifest import DOCUMENT_FILES
+    from security_rag.core.domain.manifest import DOCUMENT_FILES
+    from security_rag.core.domain.vectors import validate_sparse, validate_vectors
 
     settings.data_dir.mkdir()
     settings.ingestion_batch_size = 2
@@ -31,14 +30,18 @@ def test_fresh_ingest_creates_both_vectors_and_repeat_regenerates_both(
     dense = FakeEmbedder(parents, settings.ingestion_batch_size)
     directory = tmp_path / "qdrant"
     monkeypatch.setattr(
-        "security_rag.ingestion.pipeline.PostgresStore.from_settings", lambda settings: parents
+        "security_rag.infrastructure.persistence.postgres.postgres_store.PostgresStore.from_settings",
+        lambda settings: parents,
     )
     monkeypatch.setattr(
-        "security_rag.ingestion.pipeline.ChunkTokenizer.load", lambda *args, **kwargs: tokenizer
+        "security_rag.infrastructure.embeddings.fastembed.tokenizer.ChunkTokenizer.load",
+        lambda *args, **kwargs: tokenizer,
     )
-    monkeypatch.setattr("security_rag.ingestion.pipeline.Embedder", lambda *args: dense)
     monkeypatch.setattr(
-        "security_rag.ingestion.pipeline.QdrantClient",
+        "security_rag.infrastructure.embeddings.fastembed.embedder.Embedder", lambda *args: dense
+    )
+    monkeypatch.setattr(
+        "qdrant_client.QdrantClient",
         lambda **kwargs: QdrantClient(path=str(directory)),
     )
 
@@ -51,7 +54,7 @@ def test_fresh_ingest_creates_both_vectors_and_repeat_regenerates_both(
         assert len(parents.parents) == sum(document.parents for document in first.documents) == 10
         for record in records.values():
             validate_vectors([dense_vector(record)], 1)
-            validate_sparse(record.vector["bm25"])
+            validate_sparse(sparse_vector(record))
             assert record.payload["sparse_config_hash"] == parents.sparse_config().fingerprint
             assert record.payload["parent_id"] in {str(key) for key in parents.parents}
 
@@ -70,5 +73,13 @@ def test_sparse_configuration_changes_are_deferred_without_changing_saved_config
     parents.save_sparse_config(sparse_encoder.config)
     settings.bm25_k = 1.8
     with pytest.raises(ValueError, match="Phase 8"):
-        configure_sparse(settings, parents, ())
+        configure_sparse(
+            parents,
+            (),
+            count_terms=lambda text: pytest.fail("Should reuse the saved average"),
+            build_config=lambda average: sparse_encoder.config.model_copy(
+                update={"k": settings.bm25_k, "avg_len": average}
+            ),
+            build_encoder=lambda config: pytest.fail("Should reject the changed configuration"),
+        )
     assert parents.sparse_config() == sparse_encoder.config

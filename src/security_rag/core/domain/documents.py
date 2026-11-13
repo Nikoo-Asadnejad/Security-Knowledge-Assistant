@@ -1,4 +1,4 @@
-"""Load original Markdown and derive metadata from its exact bytes."""
+"""Source documents and validation of their original Markdown bytes."""
 
 import hashlib
 import re
@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from security_rag.ingestion.manifest import DOCUMENT_FILES, SOURCE_BASE_URL, VERSION
+from security_rag.core.domain.manifest import DOCUMENT_FILES, SOURCE_BASE_URL, VERSION
 
 
 class DocumentMetadata(BaseModel):
@@ -60,12 +60,3 @@ def parse_document(path: Path, content: bytes) -> Document:
         document_hash=hashlib.sha256(content).hexdigest(),
     )
     return Document(metadata=metadata, content=text)
-
-
-def load_document(path: Path) -> Document:
-    return parse_document(path, path.read_bytes())
-
-
-def load_documents(data_dir: Path) -> list[Document]:
-    """Load exactly the ten manifest documents, failing on missing or invalid files."""
-    return [load_document(data_dir / name) for name in DOCUMENT_FILES]

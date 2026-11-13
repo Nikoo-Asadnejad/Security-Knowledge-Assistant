@@ -1,5 +1,6 @@
 """Durable parent records using SQLAlchemy Core and explicit transactions."""
 
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
@@ -10,11 +11,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.sql.elements import ColumnElement
 
 from security_rag.config import Settings
-from security_rag.embeddings.bm25 import SparseConfig
-from security_rag.ingestion.chunk_models import ChunkedDocument, ParentChunk
-from security_rag.parent_store.migration_runner import MIGRATIONS, migrate
-from security_rag.parent_store.models import ParentReference, Revision, document_revision
-from security_rag.parent_store.schema import (
+from security_rag.core.domain.chunks import ChunkedDocument, ParentChunk
+from security_rag.core.domain.revisions import Revision, document_revision
+from security_rag.core.domain.sparse_config import SparseConfig
+from security_rag.infrastructure.persistence.postgres.migration_runner import MIGRATIONS, migrate
+from security_rag.infrastructure.persistence.postgres.schema import (
     REVISION_COLUMNS,
     document_ingestions,
     parent_chunks,
@@ -78,7 +79,9 @@ class PostgresStore:
             row = connection.execute(statement).mappings().first()
             return dict(row) if row is not None else None
 
-    def prepare_revision(self, chunks: ChunkedDocument) -> None:
+    def prepare_revision(
+        self, chunks: ChunkedDocument, *, check_existing: Callable[[tuple[Revision, ...]], None]
+    ) -> None:
         revision = document_revision(chunks)
         state = insert(document_ingestions).values(
             **revision.model_dump(),
@@ -113,7 +116,7 @@ class PostgresStore:
             rows.append(record)
         with self.engine.begin() as connection:
             existing = connection.execute(
-                select(document_ingestions).where(
+                select(*(document_ingestions.c[name] for name in REVISION_COLUMNS)).where(
                     or_(
                         document_ingestions.c.document_id == revision.document_id,
                         document_ingestions.c.document_id.in_(
@@ -124,10 +127,7 @@ class PostgresStore:
                     )
                 )
             ).mappings()
-            if any(
-                tuple(row[name] for name in REVISION_COLUMNS) != revision.key for row in existing
-            ):
-                raise ValueError("Document updates are deferred to Phase 8")
+            check_existing(tuple(Revision.model_validate(row) for row in existing))
             connection.execute(state)
             connection.execute(parents, rows)
 
@@ -139,15 +139,6 @@ class PostgresStore:
                 select(parent_chunks).where(parent_chunks.c.id.in_(ids))
             ).mappings()
             return {row["id"]: ParentChunk.model_validate(row) for row in rows}
-
-    def resolve_parents(self, references: list[ParentReference]) -> dict[UUID, ParentChunk]:
-        """Fetch only requested IDs, in one query, excluding mismatched revisions."""
-        parents = self.get_parents(list({ref.parent_id for ref in references}))
-        return {
-            ref.parent_id: parents[ref.parent_id]
-            for ref in references
-            if ref.parent_id in parents and Revision.of(parents[ref.parent_id]).key == ref.key
-        }
 
     def verify_parents(self, chunks: ChunkedDocument) -> bool:
         with self.engine.connect() as connection:
@@ -183,16 +174,15 @@ class PostgresStore:
             value = connection.scalar(select(sparse_configuration.c.config))
             return SparseConfig.model_validate(value) if value is not None else None
 
-    def save_sparse_config(self, config: SparseConfig) -> None:
+    def save_sparse_config(self, config: SparseConfig) -> SparseConfig:
         with self.engine.begin() as connection:
-            current = connection.scalar(select(sparse_configuration.c.config))
-            if current is not None:
-                if SparseConfig.model_validate(current) != config:
-                    raise ValueError("Sparse configuration updates are deferred to Phase 8")
-                return
             connection.execute(
-                insert(sparse_configuration).values(id=1, config=config.model_dump(mode="json"))
+                insert(sparse_configuration)
+                .values(id=1, config=config.model_dump(mode="json"))
+                .on_conflict_do_nothing(index_elements=[sparse_configuration.c.id])
             )
+            value = connection.execute(select(sparse_configuration.c.config)).scalar_one()
+            return SparseConfig.model_validate(value)
 
     def statistics(self) -> list[dict]:
         statement = select(document_ingestions).order_by(

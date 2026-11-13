@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from security_rag.ingestion.loader import DocumentMetadata
+from security_rag.core.domain.documents import DocumentMetadata
 
 ALGORITHM_VERSION = "markdown-parent-child-v2"
 HEADING_RULES = "atx-1-6-relative-to-title-fence-aware-source-occurrences"

@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from security_rag.ingestion.chunk_models import ChildChunk, ChunkedDocument, ParentChunk
+from security_rag.core.domain.chunks import ChildChunk, ChunkedDocument, ParentChunk
 
 
 class Revision(BaseModel):

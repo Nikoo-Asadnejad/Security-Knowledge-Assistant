@@ -3,9 +3,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from security_rag.embeddings.embedder import Embedder, validate_vectors
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.ingestion.tokenizer import ChunkTokenizer
+from security_rag.core.domain.vectors import validate_vectors
+from security_rag.infrastructure.embeddings.fastembed.embedder import Embedder
+from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
 
 def test_model_is_lazy_reused_cpu_only_and_does_not_truncate(settings, tokenizer, make_document):

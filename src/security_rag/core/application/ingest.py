@@ -2,23 +2,25 @@
 
 import json
 import logging
-from contextlib import closing
+from collections.abc import Callable, Iterable
+from functools import partial
 from time import perf_counter
+from uuid import UUID
 
 from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient
 
-from security_rag.config import Settings
-from security_rag.embeddings.bm25 import BM25Encoder, lexical_text
-from security_rag.embeddings.embedder import Embedder
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.ingestion.loader import Document, load_document
-from security_rag.ingestion.manifest import DOCUMENT_FILES
-from security_rag.ingestion.sparse_config import configure_sparse
-from security_rag.ingestion.tokenizer import ChunkTokenizer
-from security_rag.parent_store.models import ParentReference, document_revision
-from security_rag.parent_store.postgres_store import PostgresStore
-from security_rag.vector_store.qdrant_store import QdrantStore
+from security_rag.core.application.ports import (
+    ChildIndex,
+    ChildIndexEntry,
+    Chunker,
+    DenseEncoder,
+    ParentStore,
+    SparseEncoder,
+)
+from security_rag.core.domain.chunks import ParentChunk
+from security_rag.core.domain.documents import Document
+from security_rag.core.domain.lexical import identifiers, lexical_text
+from security_rag.core.domain.revisions import ParentReference, Revision, document_revision
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +58,11 @@ class IngestionReport(BaseModel):
 class IngestionPipeline:
     def __init__(
         self,
-        chunker: MarkdownChunker,
-        parents: PostgresStore,
-        children: QdrantStore,
-        embedder: Embedder,
-        sparse_encoder: BM25Encoder,
+        chunker: Chunker,
+        parents: ParentStore,
+        children: ChildIndex,
+        embedder: DenseEncoder,
+        sparse_encoder: SparseEncoder,
         *,
         batch_size: int = 32,
     ) -> None:
@@ -76,8 +78,8 @@ class IngestionPipeline:
     def ingest_document(self, document: Document) -> DocumentReport:
         chunks = self.chunker.chunk(document)
         revision = document_revision(chunks)
-        lengths = [self.chunker.tokenizer.count(child.embedding_text) for child in chunks.children]
-        if max(lengths) > self.chunker.config.child_max_tokens:
+        lengths = [self.chunker.child_token_count(child) for child in chunks.children]
+        if max(lengths) > self.chunker.child_max_tokens:
             raise ValueError("Child embedding token budget exceeded")
         report = DocumentReport(
             document_id=revision.document_id,
@@ -88,14 +90,17 @@ class IngestionPipeline:
             sparse_config_hash=self.sparse_encoder.config.fingerprint,
         )
         start = perf_counter()
-        self.parents.prepare_revision(chunks)
+        self.parents.prepare_revision(
+            chunks, check_existing=partial(check_initial_revision, revision)
+        )
         if not self.parents.verify_parents(chunks):
             raise ValueError("Persisted parents do not match the new revision")
         report.parent_persistence_seconds = perf_counter() - start
+        entries: list[ChildIndexEntry] = []
         for offset in range(0, len(chunks.children), self.batch_size):
             batch = chunks.children[offset : offset + self.batch_size]
             references = [ParentReference.model_validate(child.model_dump()) for child in batch]
-            persisted = self.parents.resolve_parents(references)
+            persisted = resolve_parents(self.parents.get_parents, references)
             invalid = sum(ref.parent_id not in persisted for ref in references)
             if invalid:
                 logger.error(
@@ -112,29 +117,34 @@ class IngestionPipeline:
             vectors = self.embedder.embed(batch)
             report.embedding_seconds += perf_counter() - start
             start = perf_counter()
-            sparse_vectors = self.sparse_encoder.encode([lexical_text(child) for child in batch])
+            texts = [lexical_text(child) for child in batch]
+            sparse_vectors = self.sparse_encoder.encode(texts)
             report.sparse_seconds += perf_counter() - start
             report.sparse_nonzero_terms += sum(len(vector.indices) for vector in sparse_vectors)
             start = perf_counter()
-            self.children.upsert(batch, vectors, sparse_vectors, report.sparse_config_hash)
+            batch_entries = tuple(
+                ChildIndexEntry(child, tuple(identifiers(text)))
+                for child, text in zip(batch, texts, strict=True)
+            )
+            self.children.upsert(batch_entries, vectors, sparse_vectors, report.sparse_config_hash)
+            entries.extend(batch_entries)
             report.indexing_seconds += perf_counter() - start
 
         start = perf_counter()
         if not self.parents.verify_parents(chunks) or not self.children.verify_children(
-            chunks, report.sparse_config_hash
+            revision, tuple(entries), report.sparse_config_hash
         ):
             raise ValueError("Stored document verification failed")
         self.parents.finish_revision(chunks, report.sparse_config_hash)
         report.indexing_seconds += perf_counter() - start
         return report
 
-    def ingest(self, settings: Settings) -> IngestionReport:
+    def ingest(self, names: Iterable[str], load: Callable[[str], Document]) -> IngestionReport:
         self.children.ensure_collection()
         report = IngestionReport()
-        for name in DOCUMENT_FILES:
+        for name in names:
             try:
-                # Do not use load_documents(): keep only one source and chunk result in memory.
-                result = self.ingest_document(load_document(settings.data_dir / name))
+                result = self.ingest_document(load(name))
             except Exception as exc:
                 report.failed += 1
                 # Store the type, not driver error strings that may include credentials.
@@ -150,31 +160,17 @@ class IngestionPipeline:
         return report
 
 
-def ingest_documents(settings: Settings) -> IngestionReport:
-    # Fail for missing sources before initializing models or opening databases.
-    for name in DOCUMENT_FILES:
-        if not (settings.data_dir / name).is_file():
-            raise ValueError(f"Missing document {name}; run download first")
-    tokenizer = ChunkTokenizer.load(
-        settings.embedding_model, path=settings.tokenizer_path, revision=settings.tokenizer_revision
-    )
-    parents = PostgresStore.from_settings(settings)
-    try:
-        chunker = MarkdownChunker(tokenizer)
+def check_initial_revision(revision: Revision, existing: tuple[Revision, ...]) -> None:
+    if any(previous != revision for previous in existing):
+        raise ValueError("Document updates are deferred to Phase 8")
 
-        def lexical_children():
-            for name in DOCUMENT_FILES:
-                yield from chunker.chunk(load_document(settings.data_dir / name)).children
 
-        sparse = configure_sparse(settings, parents, lexical_children())
-        with closing(QdrantClient(url=str(settings.qdrant_url), timeout=30)) as client:
-            return IngestionPipeline(
-                chunker,
-                parents,
-                QdrantStore(client, settings.qdrant_collection, settings.ingestion_batch_size),
-                Embedder(settings, tokenizer),
-                sparse,
-                batch_size=settings.ingestion_batch_size,
-            ).ingest(settings)
-    finally:
-        parents.close()
+def resolve_parents(
+    fetch: Callable[[list[UUID]], dict[UUID, ParentChunk]], references: list[ParentReference]
+) -> dict[UUID, ParentChunk]:
+    parents = fetch(list({reference.parent_id for reference in references}))
+    return {
+        ref.parent_id: parents[ref.parent_id]
+        for ref in references
+        if ref.parent_id in parents and Revision.of(parents[ref.parent_id]).key == ref.key
+    }

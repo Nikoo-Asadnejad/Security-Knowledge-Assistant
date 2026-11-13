@@ -17,6 +17,23 @@ Answer generation (Phase 6) and evaluation (Phase 7) are also planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
+## Code layout
+
+| Package | Responsibility |
+| --- | --- |
+| `core/application/` | Ingestion and chunk-preview workflows, initial revision and sparse configuration policy, and the interfaces they consume. |
+| `core/domain/` | Document, chunk, revision, and vector models plus Markdown and lexical rules. |
+| `infrastructure/persistence/` | PostgreSQL and Qdrant implementations of the storage ports. |
+| `infrastructure/embeddings/` | FastEmbed dense and sparse encoders and their tokenizer. |
+| `infrastructure/` | Markdown chunking, local document loading, and HTTP downloading. |
+| `bootstrap.py` | Wires concrete adapters into the CLI workflows and manages resource lifetimes. |
+| `cli.py` | Parses arguments, prints results, and sets exit codes. |
+
+The core contains the application and domain layers. The application depends on
+the domain, and concrete adapters live in infrastructure. The application checks
+revision eligibility inside the PostgreSQL transaction that writes parents and
+processing state.
+
 ## Pipeline flow
 
 ### Ingestion
@@ -113,7 +130,7 @@ PostgreSQL has a readiness health check. The Qdrant dashboard is available at
 [localhost:6333/dashboard](http://localhost:6333/dashboard).
 
 `migrate` explicitly applies Alembic's versioned Python migrations in
-`src/security_rag/parent_store/migrations/versions/` transactionally and records the
+`src/security_rag/infrastructure/persistence/postgres/migrations/versions/` transactionally and records the
 current revision in `alembic_version`. Repeating it is safe. Keep applied revisions
 unchanged and add a new revision for subsequent schema changes. Migration definitions
 are frozen separately from the application's current SQLAlchemy table definitions.
@@ -206,8 +223,8 @@ It exits nonzero if any document fails. PostgreSQL and Qdrant have no shared tra
 completion is recorded only after stored records have been verified.
 
 `stats` reads persisted state, the frozen sparse configuration, and collection counts
-without loading models. `PostgresStore.resolve_parents()` fetches requested IDs in
-one batch and excludes missing or mismatched revisions. Phase 6 will use this to
+without loading models. The application’s `resolve_parents()` uses one batched
+parent-store lookup and excludes missing or mismatched revisions. Phase 6 will use this to
 build answer context without loading the parent corpus into memory.
 
 ## Planned retrieval pipeline

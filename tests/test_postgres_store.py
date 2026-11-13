@@ -3,6 +3,7 @@
 import importlib
 import os
 from contextlib import closing
+from functools import partial
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -25,16 +26,19 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, TimeoutError
 from sqlalchemy.schema import AddConstraint, CreateSchema, DropConstraint, DropSchema
+from test_ingestion import index_entries
 
 from security_rag.config import Settings
-from security_rag.ingestion.chunker import MarkdownChunker
-from security_rag.parent_store.migration_runner import (
+from security_rag.core.application.ingest import check_initial_revision, resolve_parents
+from security_rag.core.domain.revisions import ParentReference, document_revision
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
+from security_rag.infrastructure.persistence.postgres.migration_runner import (
     INITIAL_REVISION,
     LEGACY_CHECKSUM,
     LEGACY_MIGRATION,
 )
-from security_rag.parent_store.models import ParentReference, document_revision
-from security_rag.parent_store.postgres_store import PostgresStore
+from security_rag.infrastructure.persistence.postgres.postgres_store import PostgresStore
+from security_rag.infrastructure.persistence.qdrant import qdrant_sparse_vector
 
 
 @pytest.fixture
@@ -73,12 +77,18 @@ def chunks(tokenizer, make_document):
     )
 
 
+def prepare_revision(store, chunks):
+    store.prepare_revision(
+        chunks, check_existing=partial(check_initial_revision, document_revision(chunks))
+    )
+
+
 def test_migrations_roundtrip_idempotency_and_lookup_after_restart(postgres_store, chunks):
     store = postgres_store
     assert store.migrate() == [INITIAL_REVISION, "002_sparse_indexing"]
     assert store.migrate() == []
-    store.prepare_revision(chunks)
-    store.prepare_revision(chunks)
+    prepare_revision(store, chunks)
+    prepare_revision(store, chunks)
     assert store.verify_parents(chunks)
     assert any(p.markdown_prefix or p.markdown_suffix for p in chunks.parents)
     revision = document_revision(chunks)
@@ -93,11 +103,11 @@ def test_migrations_roundtrip_idempotency_and_lookup_after_restart(postgres_stor
     restarted = PostgresStore(store.engine)
     refs = [ParentReference.model_validate(c.model_dump()) for c in chunks.children[:2]]
     with patch.object(restarted, "get_parents", wraps=restarted.get_parents) as get_parents:
-        actual = restarted.resolve_parents(refs)
+        actual = resolve_parents(restarted.get_parents, refs)
     get_parents.assert_called_once()
     assert actual == {p.id: p for p in chunks.parents if p.id in {r.parent_id for r in refs}}
     wrong = refs[0].model_copy(update={"document_hash": "0" * 64})
-    assert restarted.resolve_parents([wrong]) == {}
+    assert resolve_parents(restarted.get_parents, [wrong]) == {}
     assert restarted.get_parents([uuid4()]) == {}
     assert restarted.get_parents([]) == {}
     assert restarted.ingestion_state(revision)["status"] == "completed"
@@ -109,8 +119,8 @@ def test_live_initial_ingestion_stores_both_vectors_and_parent_context(
 ):
     from qdrant_client import QdrantClient, models
 
-    from security_rag.ingestion.pipeline import IngestionPipeline
-    from security_rag.vector_store.qdrant_store import QdrantStore
+    from security_rag.core.application.ingest import IngestionPipeline
+    from security_rag.infrastructure.persistence.qdrant import QdrantStore
 
     url = os.environ.get("TEST_QDRANT_URL")
     if not url:
@@ -141,12 +151,14 @@ def test_live_initial_ingestion_stores_both_vectors_and_parent_context(
             report = pipeline.ingest_document(source)
             config_hash = sparse_encoder.config.fingerprint
             assert report.children == len(chunks.children)
-            assert store.verify_children(chunks, config_hash)
+            assert store.verify_children(
+                document_revision(chunks), index_entries(chunks), config_hash
+            )
             info = client.get_collection(name)
             assert info.config.params.sparse_vectors["bm25"].modifier == models.Modifier.IDF
             assert info.payload_schema["identifiers"].data_type == models.PayloadSchemaType.KEYWORD
             assert info.payload_schema["document_id"].data_type == models.PayloadSchemaType.KEYWORD
-            query = sparse_encoder.encode(["CWE-79"], query=True)[0]
+            query = qdrant_sparse_vector(sparse_encoder.encode(["CWE-79"], query=True)[0])
             for code, expected in [("CWE-79", 1), ("CWE-790", 0)]:
                 hits = client.query_points(
                     name,
@@ -183,7 +195,7 @@ def test_parent_transaction_rolls_back_state_and_every_parent(postgres_store, ch
         parents.append_constraint(constraint)
         connection.execute(AddConstraint(constraint))
     with pytest.raises(IntegrityError):
-        store.prepare_revision(chunks)
+        prepare_revision(store, chunks)
     assert store.ingestion_state(document_revision(chunks)) is None
     assert store.get_parents([p.id for p in chunks.parents]) == {}
 
@@ -220,7 +232,7 @@ def test_settings_engine_enforces_pool_limit_and_statement_timeout(postgres_stor
 def create_legacy_schema(engine, checksum=LEGACY_CHECKSUM):
     """The frozen initial revision has the same tables as the original SQL migration."""
     initial = importlib.import_module(
-        "security_rag.parent_store.migrations.versions.001_parent_storage"
+        "security_rag.infrastructure.persistence.postgres.migrations.versions.001_parent_storage"
     )
     legacy = Table(
         "schema_migrations",
@@ -256,7 +268,7 @@ def test_adopts_legacy_database_without_recreating_or_losing_parents(postgres_st
             [{**parent.model_dump(mode="json"), "id": parent.id} for parent in chunks.parents],
         )
     assert store.migrate() == ["002_sparse_indexing"]
-    store.prepare_revision(chunks)
+    prepare_revision(store, chunks)
     store.finish_revision(chunks, "a" * 64)
     before = store.statistics()
     assert store.migrate() == []
@@ -281,14 +293,14 @@ def test_rejects_changed_legacy_migration_without_stamping(postgres_store):
 def test_document_updates_are_rejected_before_parent_or_state_changes(
     postgres_store, tokenizer, make_document, change
 ):
-    from security_rag.ingestion.chunk_models import ChunkingConfig
+    from security_rag.core.domain.chunks import ChunkingConfig
 
     store = postgres_store
     store.migrate()
     chunker = MarkdownChunker(tokenizer)
     source = make_document("### Test\nold alpha.\n")
     old = chunker.chunk(source)
-    store.prepare_revision(old)
+    prepare_revision(store, old)
     store.finish_revision(old, "a" * 64)
     before = store.statistics()
     if change == "config":
@@ -300,7 +312,7 @@ def test_document_updates_are_rejected_before_parent_or_state_changes(
         )
     new = chunker.chunk(source)
     with pytest.raises(ValueError, match="Phase 8"):
-        store.prepare_revision(new)
+        prepare_revision(store, new)
     assert store.statistics() == before
     assert store.verify_parents(old)
     assert store.get_parents([p.id for p in new.parents]) == {}
@@ -311,8 +323,8 @@ def test_real_postgres_and_qdrant_pipeline_recovers_from_partial_child_upserts(
 ):
     from qdrant_client import QdrantClient
 
-    from security_rag.ingestion.pipeline import IngestionPipeline
-    from security_rag.vector_store.qdrant_store import QdrantStore
+    from security_rag.core.application.ingest import IngestionPipeline
+    from security_rag.infrastructure.persistence.qdrant import QdrantStore
 
     store = postgres_store
     store.migrate()
@@ -342,7 +354,9 @@ def test_real_postgres_and_qdrant_pipeline_recovers_from_partial_child_upserts(
         assert store.verify_parents(chunks)
         assert client.count("postgres_integration").count == 1
         pipeline.ingest_document(document)
-        assert children.verify_children(chunks, sparse_encoder.config.fingerprint)
+        assert children.verify_children(
+            document_revision(chunks), index_entries(chunks), sparse_encoder.config.fingerprint
+        )
 
 
 def test_failed_completion_keeps_processing_state_until_verified_retry(
@@ -351,7 +365,7 @@ def test_failed_completion_keeps_processing_state_until_verified_retry(
     store = postgres_store
     store.migrate()
     chunks = MarkdownChunker(tokenizer).chunk(make_document("### Test\nalpha beta.\n"))
-    store.prepare_revision(chunks)
+    prepare_revision(store, chunks)
     with store.engine.begin() as connection:
         states = Table("document_ingestions", MetaData(), autoload_with=connection)
         constraint = CheckConstraint(states.c.status != "completed", name="interrupt_completion")

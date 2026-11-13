@@ -2,16 +2,11 @@ import hashlib
 import math
 
 import pytest
-from qdrant_client import models
 
-from security_rag.embeddings.bm25 import (
-    identifiers,
-    lexical_text,
-    preprocess,
-    tokens,
-    validate_sparse,
-)
-from security_rag.ingestion.chunker import MarkdownChunker
+from security_rag.core.domain.lexical import identifiers, lexical_text, preprocess
+from security_rag.core.domain.vectors import SparseVector, validate_sparse
+from security_rag.infrastructure.embeddings.fastembed.bm25 import tokens
+from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
 
 def test_actual_analyzer_preserves_codes_aliases_case_and_query_weights(sparse_encoder):
@@ -79,7 +74,7 @@ def test_long_identifier_not_silently_discarded(sparse_encoder):
 )
 def test_invalid_sparse_vectors_are_rejected(indices, values):
     with pytest.raises(ValueError):
-        validate_sparse(models.SparseVector(indices=indices, values=values))
+        validate_sparse(SparseVector(indices=indices, values=values))
 
 
 def test_lexical_input_excludes_storage_metadata_and_duplicate_headings(tokenizer, make_document):

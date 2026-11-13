@@ -4,10 +4,14 @@ from collections.abc import Iterator
 
 from qdrant_client import QdrantClient, models
 
-from security_rag.embeddings.bm25 import identifiers, lexical_text, validate_sparse
-from security_rag.embeddings.embedder import VECTOR_SIZE, validate_vectors
-from security_rag.ingestion.chunk_models import ChildChunk, ChunkedDocument
-from security_rag.parent_store.models import document_revision
+from security_rag.core.application.ports import ChildIndexEntry
+from security_rag.core.domain.revisions import Revision
+from security_rag.core.domain.vectors import (
+    VECTOR_SIZE,
+    SparseVector,
+    validate_sparse,
+    validate_vectors,
+)
 
 
 class QdrantStore:
@@ -57,24 +61,24 @@ class QdrantStore:
                 raise ValueError(f"{field} requires a keyword payload index")
 
     @staticmethod
-    def payload(child: ChildChunk, sparse_config_hash: str) -> dict:
+    def payload(entry: ChildIndexEntry, sparse_config_hash: str) -> dict:
         return {
-            **child.model_dump(mode="json"),
+            **entry.child.model_dump(mode="json"),
             "sparse_config_hash": sparse_config_hash,
-            "identifiers": identifiers(lexical_text(child)),
+            "identifiers": list(entry.identifiers),
         }
 
     def upsert(
         self,
-        children: tuple[ChildChunk, ...],
+        entries: tuple[ChildIndexEntry, ...],
         vectors: list[list[float]],
-        sparse_vectors: list[models.SparseVector],
+        sparse_vectors: list[SparseVector],
         sparse_config_hash: str,
     ) -> None:
-        if not children or len(children) > self.batch_size:
+        if not entries or len(entries) > self.batch_size:
             raise ValueError("Qdrant upsert requires a nonempty bounded batch")
-        validate_vectors(vectors, len(children))
-        if len(sparse_vectors) != len(children):
+        validate_vectors(vectors, len(entries))
+        if len(sparse_vectors) != len(entries):
             raise ValueError("Sparse vector count does not match child count")
         for vector in sparse_vectors:
             validate_sparse(vector)
@@ -82,11 +86,11 @@ class QdrantStore:
             self.collection,
             points=[
                 models.PointStruct(
-                    id=str(child.id),
-                    vector={"": dense, "bm25": sparse},
-                    payload=self.payload(child, sparse_config_hash),
+                    id=str(entry.child.id),
+                    vector={"": dense, "bm25": qdrant_sparse_vector(sparse)},
+                    payload=self.payload(entry, sparse_config_hash),
                 )
-                for child, dense, sparse in zip(children, vectors, sparse_vectors, strict=True)
+                for entry, dense, sparse in zip(entries, vectors, sparse_vectors, strict=True)
             ],
             wait=True,
         )
@@ -113,20 +117,25 @@ class QdrantStore:
             if offset is None:
                 return
 
-    def verify_children(self, chunks: ChunkedDocument, sparse_config_hash: str) -> bool:
+    def verify_children(
+        self, revision: Revision, entries: tuple[ChildIndexEntry, ...], sparse_config_hash: str
+    ) -> bool:
         expected = {
-            str(child.id): self.payload(child, sparse_config_hash) for child in chunks.children
+            str(entry.child.id): self.payload(entry, sparse_config_hash) for entry in entries
         }
         seen = set()
-        for records in self.records(document_revision(chunks).model_dump(), vectors=True):
+        for records in self.records(revision.model_dump(), vectors=True):
             for record in records:
                 point_id = str(record.id)
                 if point_id in seen or record.payload != expected.get(point_id):
                     return False
                 try:
-                    validate_vectors([dense_vector(record)], 1)
-                    validate_sparse(sparse_vector(record))
-                except (ValueError, TypeError, AttributeError):
+                    dense, sparse = dense_vector(record), sparse_vector(record)
+                    if dense is None or sparse is None:
+                        return False
+                    validate_vectors([dense], 1)
+                    validate_sparse(sparse)
+                except (ValueError, TypeError):
                     return False
                 seen.add(point_id)
         return seen == expected.keys()
@@ -137,8 +146,16 @@ class QdrantStore:
 
 
 def dense_vector(record: models.Record) -> list[float] | None:
-    return record.vector.get("") if isinstance(record.vector, dict) else record.vector
+    vector = record.vector.get("") if isinstance(record.vector, dict) else record.vector
+    return vector if isinstance(vector, list) else None
 
 
-def sparse_vector(record: models.Record) -> models.SparseVector | None:
-    return record.vector.get("bm25") if isinstance(record.vector, dict) else None
+def sparse_vector(record: models.Record) -> SparseVector | None:
+    vector = record.vector.get("bm25") if isinstance(record.vector, dict) else None
+    if not isinstance(vector, models.SparseVector):
+        return None
+    return SparseVector(indices=vector.indices, values=vector.values)
+
+
+def qdrant_sparse_vector(vector: SparseVector) -> models.SparseVector:
+    return models.SparseVector(indices=vector.indices, values=vector.values)

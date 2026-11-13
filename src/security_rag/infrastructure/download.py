@@ -10,8 +10,9 @@ import httpx
 from pydantic import BaseModel
 
 from security_rag.config import Settings
-from security_rag.ingestion.loader import DocumentMetadata, load_document, parse_document
-from security_rag.ingestion.manifest import DOCUMENT_FILES, RAW_BASE_URL
+from security_rag.core.domain.documents import DocumentMetadata, parse_document
+from security_rag.core.domain.manifest import DOCUMENT_FILES, RAW_BASE_URL
+from security_rag.infrastructure.files import load_document
 
 logger = logging.getLogger(__name__)
 

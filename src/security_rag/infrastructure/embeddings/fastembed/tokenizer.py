@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tokenizers import Tokenizer
 
-from security_rag.ingestion.chunk_models import sha256
+from security_rag.core.domain.chunks import sha256
 
 
 class ChunkTokenizer:
