@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from functools import partial
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -19,8 +20,12 @@ from security_rag.infrastructure.download import download_documents as download_
 from security_rag.infrastructure.files import load_document, load_documents
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
+    from security_rag.core.application.answer import AnswerResult
     from security_rag.core.application.ports import SearchFilters
-    from security_rag.core.application.search import SearchResult
+    from security_rag.core.application.search import RetrievalResult, SearchResult
+    from security_rag.core.domain.chunks import ParentChunk
     from security_rag.infrastructure.embeddings.fastembed.tokenizer import ChunkTokenizer
     from security_rag.infrastructure.markdown_chunker import MarkdownChunker
 
@@ -126,6 +131,47 @@ def ingest_documents(settings: Settings) -> IngestionReport:
 
 @contextmanager
 def search_runtime(settings: Settings) -> Iterator[Callable[[str, SearchFilters], SearchResult]]:
+    with _retrieval_runtime(settings) as (retrieve, _):
+        yield lambda query, filters: retrieve(query, filters).search_result()
+
+
+@dataclass(frozen=True)
+class ApplicationServices:
+    search: Callable[[str, SearchFilters], SearchResult]
+    ask: Callable[[str, SearchFilters], AnswerResult]
+
+
+@contextmanager
+def application_runtime(settings: Settings) -> Iterator[ApplicationServices]:
+    from security_rag.core.application.answer import Ask
+    from security_rag.infrastructure.generation.answer_generator import LangChainGenerator
+    from security_rag.infrastructure.generation.model_factory import create_local_chat_model
+
+    with _retrieval_runtime(settings) as (retrieve, fetch_parents):
+        ask = Ask(
+            retrieve,
+            fetch_parents,
+            LangChainGenerator(
+                settings,
+                partial(create_local_chat_model, settings=settings),
+            ),
+            context_window=settings.llm_context_window,
+            max_output_tokens=settings.llm_max_output_tokens,
+        )
+        yield ApplicationServices(
+            search=lambda query, filters: retrieve(query, filters).search_result(), ask=ask.run
+        )
+
+
+@contextmanager
+def _retrieval_runtime(
+    settings: Settings,
+) -> Iterator[
+    tuple[
+        Callable[[str, SearchFilters], RetrievalResult],
+        Callable[[list[UUID]], dict[UUID, ParentChunk]],
+    ]
+]:
     from qdrant_client import QdrantClient
 
     from security_rag.core.application.search import Search, SearchUnavailable, completed_corpus
@@ -146,7 +192,7 @@ def search_runtime(settings: Settings) -> Iterator[Callable[[str, SearchFilters]
         chunking_hash = None
         model_lock = Lock()
 
-        def run(query: str, filters: SearchFilters) -> SearchResult:
+        def run(query: str, filters: SearchFilters) -> RetrievalResult:
             nonlocal encoder, chunking_hash
             with parents.search_snapshot() as (config, states):
                 if config is None or config != config_for_average(
@@ -164,6 +210,6 @@ def search_runtime(settings: Settings) -> Iterator[Callable[[str, SearchFilters]
                 config_hash = config.fingerprint
                 revisions, count = completed_corpus(states, config_hash, chunking_hash)
                 index = store.search_index(revisions, config_hash, count)
-                return Search(encoder.for_config(config), index, reranker).run(query, filters)
+                return Search(encoder.for_config(config), index, reranker).retrieve(query, filters)
 
-        yield run
+        yield run, parents.get_parents

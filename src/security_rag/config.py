@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, HttpUrl, SecretStr, StringConstraints
+from pydantic import Field, HttpUrl, SecretStr, StringConstraints, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from security_rag.core.domain.chunks import DEFAULT_CHILD_MAX_TOKENS, EMBEDDING_MAX_TOKENS
@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     bm25_token_max_length: int = Field(default=512, ge=40, le=8192)
     tokenizer_path: Path | None = None
     tokenizer_revision: NonEmptyString = "main"
-    llm_base_url: HttpUrl = HttpUrl("https://api.openai.com/v1")
-    llm_api_key: SecretStr = SecretStr("")
+    llm_base_url: HttpUrl = HttpUrl("http://localhost:11434")
     llm_model: str = ""
+    llm_context_window: int = Field(default=4096, ge=512)
+    llm_max_output_tokens: int = Field(default=512, gt=0)
+    llm_timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_generation_budget(self) -> "Settings":
+        if self.llm_max_output_tokens >= self.llm_context_window:
+            raise ValueError("LLM_MAX_OUTPUT_TOKENS must be smaller than LLM_CONTEXT_WINDOW")
+        return self

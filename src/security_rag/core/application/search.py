@@ -1,6 +1,7 @@
 """Retrieve and rank child chunks through the search ports."""
 
 import logging
+from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
 
@@ -52,6 +53,26 @@ class SearchResult(BaseModel):
     results: list[SearchHit]
 
 
+@dataclass(frozen=True)
+class RankedChild:
+    child: ChildChunk
+    hit: SearchHit
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    retrieval_mode: Literal["hybrid", "dense_only"]
+    degraded: bool
+    matches: tuple[RankedChild, ...]
+
+    def search_result(self) -> SearchResult:
+        return SearchResult(
+            retrieval_mode=self.retrieval_mode,
+            degraded=self.degraded,
+            results=[match.hit for match in self.matches],
+        )
+
+
 class Search:
     def __init__(self, encoder: QueryEncoder, index: CandidateIndex, reranker: Reranker) -> None:
         self.encoder = encoder
@@ -59,6 +80,9 @@ class Search:
         self.reranker = reranker
 
     def run(self, query: str, filters: SearchFilters) -> SearchResult:
+        return self.retrieve(query, filters).search_result()
+
+    def retrieve(self, query: str, filters: SearchFilters) -> RetrievalResult:
         query = query.strip()
         if not query:
             raise InvalidSearchQuery("Query must contain text")
@@ -88,13 +112,16 @@ class Search:
         order = list(range(len(ranked)))
         if ranked and not degraded:
             order.sort(key=lambda index: (-scored[index], index, ranked[index].child.id))
-        return SearchResult(
+        return RetrievalResult(
             retrieval_mode="hybrid" if hybrid else "dense_only",
             degraded=degraded,
-            results=[
-                _hit(ranked[index].child, ranked[index].score, scores[index], index, hybrid)
+            matches=tuple(
+                RankedChild(
+                    ranked[index].child,
+                    _hit(ranked[index].child, ranked[index].score, scores[index], index, hybrid),
+                )
                 for index in order[:RESULT_LIMIT]
-            ],
+            ),
         )
 
 

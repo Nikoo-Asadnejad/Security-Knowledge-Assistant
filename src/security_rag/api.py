@@ -1,4 +1,4 @@
-"""FastAPI entry point for child retrieval."""
+"""FastAPI entry points for retrieval and grounded answers."""
 
 import logging
 from collections.abc import Callable
@@ -8,8 +8,9 @@ from typing import Annotated
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, StringConstraints, field_validator
 
-from security_rag.bootstrap import search_runtime
+from security_rag.bootstrap import application_runtime
 from security_rag.config import Settings
+from security_rag.core.application.answer import AnswerResult
 from security_rag.core.application.ports import SearchFilters
 from security_rag.core.application.search import InvalidSearchQuery, SearchResult
 from security_rag.core.domain.lexical import IDENTIFIER, identifiers
@@ -19,10 +20,9 @@ QueryText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 FilterText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
 
 
-class SearchRequest(BaseModel):
+class FilterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    query: QueryText
     document_id: FilterText | None = None
     identifier: FilterText | None = None
 
@@ -36,17 +36,28 @@ class SearchRequest(BaseModel):
         return identifiers(value)[0]
 
 
+class SearchRequest(FilterRequest):
+    query: QueryText
+
+
+class AskRequest(FilterRequest):
+    question: QueryText
+
+
 def create_app(
     search: Callable[[str, SearchFilters], SearchResult] | None = None,
+    ask: Callable[[str, SearchFilters], AnswerResult] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if search is not None:
+        if search is not None or ask is not None:
             app.state.search = search
+            app.state.ask = ask
             yield
         else:
-            with search_runtime(Settings()) as run:
-                app.state.search = run
+            with application_runtime(Settings()) as services:
+                app.state.search = services.search
+                app.state.ask = services.ask
                 yield
 
     app = FastAPI(title="AI Security Knowledge Assistant", lifespan=lifespan)
@@ -63,6 +74,20 @@ def create_app(
             logger.warning("search_unavailable error_type=%s", type(exc).__name__)
             raise HTTPException(
                 status_code=503, detail="Search is temporarily unavailable"
+            ) from exc
+
+    @app.post("/ask", response_model=AnswerResult)
+    def ask_endpoint(body: AskRequest, request: Request) -> AnswerResult:
+        try:
+            return request.app.state.ask(
+                body.question, SearchFilters(body.document_id, body.identifier)
+            )
+        except InvalidSearchQuery as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("answer_unavailable error_type=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503, detail="Answer generation is temporarily unavailable"
             ) from exc
 
     return app

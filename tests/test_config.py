@@ -12,7 +12,7 @@ def test_defaults_need_no_llm_credentials(settings):
     assert settings.embedding_model == "BAAI/bge-small-en-v1.5"
     assert settings.tokenizer_path is None
     assert settings.tokenizer_revision == "main"
-    assert settings.llm_api_key.get_secret_value() == ""
+    assert str(settings.llm_base_url) == "http://localhost:11434/"
     assert settings.llm_model == ""
     assert Settings().data_dir == Path("data/owasp")
 
@@ -20,7 +20,7 @@ def test_defaults_need_no_llm_credentials(settings):
 def test_environment_overrides_dotenv(settings, monkeypatch):
     Path(".env").write_text(
         "DATA_DIR=custom/docs\nDOWNLOAD_RETRIES=3\n"
-        "QDRANT_COLLECTION=custom_collection\nLLM_API_KEY=local-secret\n"
+        "QDRANT_COLLECTION=custom_collection\n"
         "UNRELATED_VARIABLE=ignored\n"
     )
     monkeypatch.setenv("DOWNLOAD_RETRIES", "1")
@@ -28,9 +28,6 @@ def test_environment_overrides_dotenv(settings, monkeypatch):
     assert loaded.data_dir == Path("custom/docs")
     assert loaded.download_retries == 1
     assert loaded.qdrant_collection == "custom_collection"
-    assert loaded.llm_api_key.get_secret_value() == "local-secret"
-    assert "local-secret" not in repr(loaded)
-    assert "local-secret" not in loaded.model_dump_json()
 
 
 def test_database_url_is_not_serialized_in_reports(settings, monkeypatch):

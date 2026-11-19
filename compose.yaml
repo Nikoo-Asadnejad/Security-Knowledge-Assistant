@@ -1,4 +1,12 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    restart: unless-stopped
   postgres:
     image: postgres:17
     environment:
@@ -25,5 +33,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  ollama_storage:
   postgres_storage:
   qdrant_storage:

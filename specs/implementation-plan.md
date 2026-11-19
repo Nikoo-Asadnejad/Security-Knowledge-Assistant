@@ -28,7 +28,8 @@ replacement, and incremental processing belong to Phase 8, with design discussed
 | Lexical sparse embeddings | FastEmbed — `Qdrant/bm25`, with Qdrant IDF |
 | Candidate fusion | Reciprocal rank fusion (RRF) |
 | Reranking | Sentence Transformers CrossEncoder — `cross-encoder/ms-marco-MiniLM-L6-v2` |
-| LLM | Configurable OpenAI-compatible API |
+| LLM | Local Qwen through Ollama in Docker behind a replaceable generation interface |
+| RAG generation framework | LangChain prompt, chat model, and structured output pipeline |
 | Chunking | LangChain text splitters |
 | Tokenizer | Embedding-model-compatible tokenizer |
 | Reranker runtime | sentence-transformers |
@@ -38,7 +39,8 @@ replacement, and incremental processing belong to Phase 8, with design discussed
 | Settings | pydantic-settings |
 | Observability | Python structured logging |
 
-No LangGraph is required for the MVP.
+Use LangChain for the initial RAG pipeline. Keep framework dependencies in
+infrastructure adapters; LangGraph can be introduced later for branching or stateful workflows.
 
 ## 3. Data Source and Downloading
 
@@ -188,7 +190,8 @@ Keep the original child content separately in the payload. Store `parent_id` as 
 
 Use the embedding model's tokenizer with truncation disabled. The 450-token child limit includes the contextual prefix, child text, any embedding wrapper, and special tokens. Compute the available body budget after accounting for that overhead and validate the exact input before embedding. The model's hard limit is 512 tokens; never rely on silent truncation. Reject a configuration or heading prefix that leaves no usable body budget.
 
-Use the same tokenizer without truncation to enforce the 1,200-token parent limit, including heading context and any restored Markdown syntax. Parents do not have the embedding model's 512-token restriction because they are not embedded. Answer-context budgeting uses the configured generation model's tokenizer.
+Use the same tokenizer without truncation to enforce the 1,200-token parent limit, including heading context and any restored Markdown syntax. Parents do not have the embedding model's 512-token restriction because they are not embedded. Answer-context budgeting initially uses the explicitly labeled conservative Qwen
+byte-based estimate described in the README; exact generation-tokenizer integration is deferred.
 
 Use `MarkdownHeaderTextSplitter` for heading metadata where appropriate and a token-aware `RecursiveCharacterTextSplitter` for oversized units. Preserve metadata with `split_documents`; the default character-count length function is insufficient. Keep parent creation, deterministic IDs, and source-text preservation explicit in the ingestion code. Do not add the full LangChain retriever framework solely for this feature.
 
@@ -432,7 +435,11 @@ Answer + Source Citations
 - Treat retrieved documents as untrusted reference material, not executable instructions.
 - Keep the LLM client configurable through environment settings.
 
-Do not use LangGraph or agents.
+Use a LangChain generation chain behind an application-owned interface. Local
+Qwen through Ollama in Docker is the default; it requires no cloud API key.
+Keep retrieval and context policies independent of the framework. LangGraph remains
+a future option when the workflow needs branching or persistent state; no agents
+are needed for this phase.
 
 ## 9. FastAPI Endpoints
 
@@ -705,7 +712,11 @@ Hybrid orchestration remains Phase 5.
 
 ### Phase 6 — Answer generation
 
-- Implement the configurable LLM client.
+- Implement the replaceable generation interface and LangChain adapter for local
+  Qwen through Ollama in Docker, configured by endpoint, installed model tag, and token budgets.
+- Use an explicitly labeled conservative local prompt-token estimate for the initial
+  Ollama integration. Reserve output tokens and configure num_ctx/num_predict; do not
+  download models/tokenizers during startup. Exact tokenizer integration is deferred.
 - Implement `/ask`.
 - Build a grounded RAG prompt.
 - Deduplicate final child hits by parent ID, batch-fetch matching parents from PostgreSQL, preserve retrieval rank, enforce the generation-context budget, and handle missing or mismatched parents with child-text fallback.

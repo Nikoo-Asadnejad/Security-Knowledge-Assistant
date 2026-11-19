@@ -1,8 +1,8 @@
 # AI Security Knowledge Assistant
 
-A local RAG assistant that will answer LLM security questions using retrieved OWASP
-documentation, dense + BM25 hybrid retrieval, and a configurable OpenAI-compatible
-LLM. It uses local CPU embeddings, PostgreSQL for parents, and Qdrant for searchable
+A local RAG assistant that answers LLM security questions using retrieved OWASP
+documentation, dense + BM25 hybrid retrieval, and local Qwen through Ollama in Docker
+and LangChain. It uses local CPU embeddings, PostgreSQL for parents, and Qdrant for searchable
 children.
 Built with Python 3.12+, uv, and FastAPI.
 
@@ -13,7 +13,10 @@ chunking, persistent PostgreSQL parents and ingestion state, local CPU embedding
 and initial Qdrant child indexing with both dense and BM25 sparse vectors.
 Phase 5 implements hybrid retrieval and `/search`. Document updates are deferred
 to Phase 8; its flow will be discussed before implementation.
-Answer generation (Phase 6) and evaluation (Phase 7) are also planned.
+Phase 6 adds `/ask`, bounded parent context, and source citations using a replaceable
+generation adapter. Automated tests use mocked generation endpoints. Local generation
+and citation validation were also smoke-tested with `qwen2.5:3b` in Docker using an
+isolated retrieval fixture. Full-corpus evaluation (Phase 7) is planned.
 
 The implementation plan is in [specs/implementation-plan.md](specs/implementation-plan.md).
 
@@ -21,10 +24,11 @@ The implementation plan is in [specs/implementation-plan.md](specs/implementatio
 
 | Package | Responsibility |
 | --- | --- |
-| `core/application/` | Ingestion and chunk-preview workflows, initial revision and sparse configuration policy, and the interfaces they consume. |
+| `core/application/` | Ingestion, retrieval, answer orchestration, context budgeting, revision policies, and their interfaces. |
 | `core/domain/` | Document, chunk, revision, and vector models plus Markdown and lexical rules. |
 | `infrastructure/persistence/` | PostgreSQL and Qdrant implementations of the storage ports. |
 | `infrastructure/embeddings/` | FastEmbed dense and sparse encoders and their tokenizer. |
+| `infrastructure/generation/` | LangChain prompt/model/output pipeline, ChatOllama, and local token estimates. |
 | `infrastructure/` | Markdown chunking, local document loading, and HTTP downloading. |
 | `bootstrap.py` | Wires concrete adapters into the CLI workflows and manages resource lifetimes. |
 | `cli.py` | Parses arguments, prints results, and sets exit codes. |
@@ -61,7 +65,7 @@ writes precede Qdrant child writes, and incomplete ingestion remains retryable.
 
 ### Retrieval and answers
 
-Phase 5 implements hybrid retrieval and `/search`. Phase 6 will add parent
+Phase 5 implements hybrid retrieval and `/search`. Phase 6 adds parent
 expansion and `/ask`. The cross-encoder reranks the fused candidates before either
 response path.
 
@@ -82,7 +86,7 @@ flowchart TD
     deduplicate --> parents[("PostgreSQL<br/>One batch lookup of matching parents")]
     parents --> validate["Validate parent IDs and revision hashes<br/>Use child text for missing or mismatched parents"]
     validate --> context["Build context within the LLM token budget"]
-    context --> llm["Configurable LLM<br/>Generate a grounded answer"]
+    context --> llm["LangChain + local Qwen<br/>Ollama in Docker"]
     llm --> answer["Answer with citations<br/>Only sources included in context"]
 ```
 
@@ -100,10 +104,10 @@ uv run ruff format --check .
 ```
 
 Run commands from the project root. Settings load from `.env`; environment variables
-take precedence. Keep secrets in `.env`. LLM credentials are optional through Phase 5.
+take precedence. Keep secrets in `.env`. Local Ollama requires no LLM API key.
 
 The settings in `.env.example` configure the download directory, per-request timeout,
-retry count, Qdrant URL and collection, embedding model, and OpenAI-compatible LLM.
+retry count, Qdrant URL and collection, embedding model, and local generation endpoints.
 `DOWNLOAD_RETRIES` is the number of retries after the initial attempt (default 2,
 maximum 5). `DOWNLOAD_TIMEOUT_SECONDS` must be positive (default 30).
 
@@ -229,7 +233,7 @@ completion is recorded only after stored records have been verified.
 
 `stats` reads persisted state, the frozen sparse configuration, and collection counts
 without loading models. The application’s `resolve_parents()` uses one batched
-parent-store lookup and excludes missing or mismatched revisions. Phase 6 will use this to
+parent-store lookup and excludes missing or mismatched revisions. Phase 6 uses the same revision rules to
 build answer context without loading the parent corpus into memory.
 
 ## Search API
@@ -264,16 +268,92 @@ finds no hits. Encoder or store failures and incomplete indexing return 503.
 Reranker failure returns the first three candidates in retrieval order with
 `degraded: true` and null reranker scores.
 
-In Phase 6, `/ask` will deduplicate those children's parent IDs and fetch the matching
-parents from PostgreSQL in one parameterized batch query. It will preserve the rank
-of each parent's highest-ranked child, validate document/configuration revisions,
-and build the generation context within the LLM's token budget. A request will load
+In Phase 6, `/ask` deduplicates those children's parent IDs and fetches the matching
+parents from PostgreSQL in one parameterized batch query. It preserves the rank
+of each parent's highest-ranked child, validates document/configuration revisions,
+and builds the generation context within the LLM's token budget. A request loads
 at most three parents into memory with the selected Top-3 retrieval configuration.
 The application will not load the parent corpus into memory at startup.
 
-Missing or mismatched parent records will use the matching child text as fallback.
-A PostgreSQL lookup failure will be logged and returned as a service-unavailable
-response. Answers will cite only sources included in the generation context.
+Missing or mismatched parent records use the matching child text as fallback.
+A PostgreSQL lookup failure is logged and returned as a service-unavailable
+response. Answers cite only sources included in the generation context.
+
+## Local Qwen answers
+
+Use your existing Ollama container with port 11434 published on localhost, or
+start the optional Compose service using an image already present on this machine:
+
+```sh
+docker compose --profile llm up -d --pull never ollama
+docker compose exec ollama ollama list
+```
+
+The service stores Ollama data in the persistent `ollama_storage` volume. An existing
+container can use its own model volume; configure the application to reach that
+container rather than starting another server on the same port. This setup performs
+no model pulls. Set the exact Qwen tag listed by Ollama in `.env`:
+
+```dotenv
+LLM_BASE_URL=http://localhost:11434
+LLM_MODEL=<your-installed-Ollama-Qwen-tag>
+LLM_CONTEXT_WINDOW=4096
+LLM_MAX_OUTPUT_TOKENS=512
+LLM_TIMEOUT_SECONDS=120
+```
+
+For example, `qwen2.5:3b` is an Ollama tag; a Docker Model Runner `ai/qwen...` image
+identifier is not an Ollama model tag. The application runs on the host and connects
+to the published port. If the API is later containerized, use `http://ollama:11434`
+on the Compose network. See the [Ollama Docker instructions](https://docs.ollama.com/docker).
+
+Ollama has no standard preflight token-count endpoint. Context budgeting therefore
+uses a deliberately conservative local estimate: one token per UTF-8 byte of the
+complete system/user message bodies, plus 256 tokens for the standard Qwen chat
+wrapper. The output budget is reserved before context is fitted. This requires no
+network calls, extra tokenizer files, or model downloads, but can include less
+context than exact token counting. Revisit the allowance when changing tokenizers
+or using a custom chat template. The API labels the value `estimated_input_tokens`.
+`ChatOllama` sends the configured context/output limits as `num_ctx`/`num_predict`,
+requests JSON output, and disables Qwen thinking for this answer pipeline.
+
+After ingestion, run the API and ask a question:
+
+```sh
+uv run uvicorn security_rag.api:app --host 127.0.0.1 --port 8000
+curl -fsS http://127.0.0.1:8000/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"How can prompt injection be mitigated?","identifier":"LLM01"}'
+```
+
+`POST /ask` accepts `question` and the same optional document/identifier filters as
+`/search`. It returns `answer`, `status` (`answered` or `insufficient_evidence`),
+`sources`, `retrieval_mode`, `degraded`, and the complete prompt's `estimated_input_tokens`.
+Inline labels such as `[S1]` map to source metadata with `citation_id`, `parent_id`,
+`matched_child_ids`, document title, section, filename, GitHub URL, and `context_kind`
+(`parent` or `children`). Only cited sources are returned.
+
+Full parents are preferred. Complete matching children are used when a parent is
+missing, mismatched, or does not fit; remaining context is omitted in retrieval
+order. Empty context and model abstention return an explicit insufficient-evidence
+response. Unknown citation labels, invented links, incomplete output, or generation
+dependency failures return a sanitized 503. Citation checks establish provenance;
+semantic support and answer correctness still require Phase 7 evaluation.
+
+The `Ask` use case depends only on the `AnswerGenerator` interface's
+`estimate_input_tokens` and `generate` methods. LangChain's prompt, chat model, and
+structured output parser live in the infrastructure adapter. Changing a compatible
+local model requires configuration only. A different backend can implement that
+interface and be selected in `bootstrap.py`; it must also supply an appropriate
+prompt-budget estimate. LangGraph can compose these use cases later if branching
+or stateful workflows become necessary.
+
+Within the LangChain adapter, model construction is injected through a factory
+returning the generic `BaseChatModel` interface. The Ollama connection
+options are isolated in `infrastructure/generation/model_factory.py`. That factory
+returns `ChatOllama`, which calls the native Ollama API; the generation pipeline
+has no dependency on a concrete model class. Another LangChain chat integration can
+be supplied through the factory without changing the prompt/output pipeline.
 
 Phase 7 will compare dense-only, BM25-only, fused, and reranked results on the same
 labeled questions, including code/keyword cases and semantic paraphrases. It will
@@ -351,7 +431,7 @@ their child IDs and texts nested under `children`.
 Parents and children remain in memory in the per-document `ChunkedDocument`
 returned by the chunker. The `chunk` command is a preview: it writes no chunk files
 and does not access PostgreSQL or Qdrant. Use `ingest` to persist parents in
-PostgreSQL and child vectors in Qdrant. Future answer generation will fetch matching
+PostgreSQL and child vectors in Qdrant. Answer generation fetches matching
 parents directly from PostgreSQL.
 
 ## Structure and tests
@@ -429,7 +509,7 @@ adapted OWASP material.
 - [x] Phase 3: PostgreSQL parent storage, local embeddings, and initial Qdrant child ingestion.
 - [x] Phase 4: Dense and BM25 sparse vectors written together during initial ingestion.
 - [x] Phase 5: Dense + BM25 hybrid retrieval, RRF, reranking, and Top-3 search API.
-- [ ] Phase 6: Grounded answers and source citations.
+- [x] Phase 6: Grounded answers and source citations (live Ollama generation and citation smoke test passed with fixture retrieval).
 - [ ] Phase 7: Evaluation dataset, metrics, tests, and documentation.
 - [ ] Phase 8: Document updates for PostgreSQL parents and Qdrant children; design discussion first.
 
